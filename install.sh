@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_RAW_BASE="https://raw.githubusercontent.com/<USER>/<REPO>/main"
+REPO_RAW_BASE="https://raw.githubusercontent.com/yasinznl/backhaul-failover/main"
 
 BIN_DIR="/usr/local/bin"
 SYSTEMD_DIR="/etc/systemd/system"
