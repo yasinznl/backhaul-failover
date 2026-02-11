@@ -47,4 +47,6 @@ systemctl daemon-reload
 systemctl enable --now backhaul-failover.timer >/dev/null
 
 echo "[+] Installed."
-exec "$MENU_BIN"
+"$MENU_BIN" || true
+exit 0
+
