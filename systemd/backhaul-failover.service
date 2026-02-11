@@ -1,0 +1,8 @@
+[Unit]
+Description=Backhaul failover monitor (anti-flap + auto toml/port)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/backhaul-failover.sh
