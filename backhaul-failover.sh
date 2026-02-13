@@ -48,9 +48,11 @@ log_bad(){    c_red   "[$(date '+%F %T')] ❌ $*"; }
 log_switch(){ c_cyan  "[$(date '+%F %T')] 🔁 $*"; }
 
 list_services() {
-  systemctl list-units --type=service --all "$SERVICE_GLOB" --no-legend --no-pager 2>/dev/null \
-    | awk '{print $1}' | sed '/^$/d'
+  systemctl list-units --type=service --all --no-legend --no-pager 2>/dev/null \
+    | awk '{print $1}' \
+    | grep -E "^backhaul-iran[0-9]+\.service$"
 }
+
 
 svc_num() { echo "$1" | grep -Eo '[0-9]+' | tail -n1; }
 
