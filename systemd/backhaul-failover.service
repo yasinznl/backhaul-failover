@@ -1,5 +1,5 @@
 [Unit]
-Description=Backhaul failover monitor (anti-flap + traffic <50KB/s + auto toml/port)
+Description=Backhaul failover monitor (anti-flap + 10m traffic drop + auto toml/port)
 After=network-online.target
 Wants=network-online.target
 
