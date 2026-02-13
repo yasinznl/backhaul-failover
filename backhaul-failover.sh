@@ -1,5 +1,6 @@
 
-#!/usr/bin/env bash
+#!/bin/bash
+
 set -euo pipefail
 
 SERVICE_GLOB="backhaul-iran*.service"
@@ -17,9 +18,9 @@ CANDIDATE_WAIT_SEC=30
 CANDIDATE_POLL_SEC=3
 
 # ---- Traffic health ----
-# قطعی = زیر 50KB/s
+
 TRAFFIC_MIN_KBPS=50
-TRAFFIC_SAMPLE_SEC=1   # برای اندازه‌گیری نرخ، 1 ثانیه نمونه‌گیری می‌کنیم
+TRAFFIC_SAMPLE_SEC=1 
 
 LOCKFILE="/run/backhaul-failover.lock"
 exec 9>"$LOCKFILE"
