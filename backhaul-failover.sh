@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-
 set -euo pipefail
 
 SERVICE_GLOB="backhaul-iran*.service"
@@ -16,10 +15,14 @@ FATAL_REGEX="(panic|fatal|segfault|address already in use|bind failed|cannot bin
 CANDIDATE_WAIT_SEC=30
 CANDIDATE_POLL_SEC=3
 
-# ---- Traffic health ----
+# ---- Traffic health (10-min drop detection) ----
+# Compare avg traffic in last 10m vs previous 10m. If drop >= 90% -> unhealthy.
+TRAFFIC_DROP_WINDOW_SEC=600     # 10 minutes
+TRAFFIC_DROP_THRESHOLD_PCT=90   # drop >= 90% => bad
+TRAFFIC_LOG_DIR="/run/backhaul-traffic"
 
-TRAFFIC_MIN_KBPS=50
-TRAFFIC_SAMPLE_SEC=1 
+# Fallback (optional): if prev window too small, ignore drop check
+TRAFFIC_MIN_PREV_BPS=1024       # 1KB/s
 
 LOCKFILE="/run/backhaul-failover.lock"
 exec 9>"$LOCKFILE"
@@ -104,32 +107,88 @@ get_port_bytes_sum_now() {
       END { printf "%.0f\n", (rx+tx) }'
 }
 
-get_port_bps_instant() {
+ensure_traffic_dir() { mkdir -p "$TRAFFIC_LOG_DIR" 2>/dev/null || true; }
+traffic_log_file() { local port="$1"; echo "${TRAFFIC_LOG_DIR}/port-${port}.log"; }
+
+traffic_record_sample() {
   local port="$1"
-  local t1 t2 b1 b2 dt db
+  ensure_traffic_dir
+  local f ts b
+  f="$(traffic_log_file "$port")"
+  ts="$(date +%s)"
+  b="$(get_port_bytes_sum_now "$port" 2>/dev/null || echo 0)"
+  echo "$ts $b" >> "$f"
+  tail -n 200 "$f" > "${f}.tmp" 2>/dev/null && mv -f "${f}.tmp" "$f" 2>/dev/null || true
+}
 
-  b1="$(get_port_bytes_sum_now "$port" || echo 0)"
-  t1="$(date +%s)"
-  sleep "$TRAFFIC_SAMPLE_SEC"
-  b2="$(get_port_bytes_sum_now "$port" || echo 0)"
-  t2="$(date +%s)"
+traffic_sample_at_or_before() {
+  local f="$1" target="$2"
+  awk -v t="$target" '
+    ($1 <= t) { last_ts=$1; last_b=$2 }
+    END { if (last_ts=="") exit 1; print last_ts, last_b }
+  ' "$f"
+}
 
-  dt=$((t2-t1))
+traffic_avg_bps_between() {
+  local port="$1" start="$2" end="$3"
+  local f s e
+  f="$(traffic_log_file "$port")"
+  [[ -f "$f" ]] || { echo 0; return 0; }
+
+  s="$(traffic_sample_at_or_before "$f" "$start" 2>/dev/null || true)"
+  e="$(traffic_sample_at_or_before "$f" "$end" 2>/dev/null || true)"
+  [[ -n "$s" && -n "$e" ]] || { echo 0; return 0; }
+
+  local ts1 b1 ts2 b2 dt db
+  ts1="$(awk '{print $1}' <<<"$s")"; b1="$(awk '{print $2}' <<<"$s")"
+  ts2="$(awk '{print $1}' <<<"$e")"; b2="$(awk '{print $2}' <<<"$e")"
+
+  dt=$((ts2-ts1))
   db=$((b2-b1))
-
   if (( dt <= 0 || db < 0 )); then
-    echo 0
-    return 0
+    echo 0; return 0
   fi
   echo $(( db / dt ))
 }
 
-has_min_traffic_now() {
+traffic_drop_stats() {
+  # prints: prev_bps cur_bps drop_pct
   local port="$1"
-  local min_bps=$(( TRAFFIC_MIN_KBPS * 1024 ))
-  local bps
-  bps="$(get_port_bps_instant "$port" || echo 0)"
-  (( bps >= min_bps ))
+  traffic_record_sample "$port"
+
+  local now cur_start cur_end prev_start prev_end
+  now="$(date +%s)"
+  cur_end="$now"
+  cur_start=$((now - TRAFFIC_DROP_WINDOW_SEC))
+  prev_end="$cur_start"
+  prev_start=$((prev_end - TRAFFIC_DROP_WINDOW_SEC))
+
+  local prev_bps cur_bps
+  prev_bps="$(traffic_avg_bps_between "$port" "$prev_start" "$prev_end")"
+  cur_bps="$(traffic_avg_bps_between "$port" "$cur_start" "$cur_end")"
+
+  local drop=0
+  if (( prev_bps > 0 )); then
+    # integer drop% = 100 - (cur*100/prev)
+    drop=$(( 100 - (cur_bps * 100 / prev_bps) ))
+    if (( drop < 0 )); then drop=0; fi
+    if (( drop > 100 )); then drop=100; fi
+  fi
+
+  echo "$prev_bps $cur_bps $drop"
+}
+
+has_traffic_drop_10m() {
+  local port="$1"
+  local prev_bps cur_bps drop
+  read -r prev_bps cur_bps drop < <(traffic_drop_stats "$port")
+
+  # اگر بازه قبلی خیلی کم بوده، معیار افت معتبر نیست
+  if (( prev_bps < TRAFFIC_MIN_PREV_BPS )); then
+    return 1
+  fi
+
+  (( drop >= TRAFFIC_DROP_THRESHOLD_PCT ))
 }
 
 is_healthy() {
@@ -138,7 +197,10 @@ is_healthy() {
   is_listening "$bind_port" || return 1
   has_fatal_errors_recently "$svc" && return 1
   has_established_now "$bind_port" || return 1
-  has_min_traffic_now "$bind_port" || return 1
+
+  # drop-based health:
+  has_traffic_drop_10m "$bind_port" && return 1
+
   return 0
 }
 
@@ -174,7 +236,24 @@ wait_until_healthy() {
   return 1
 }
 
-# ---- CLI helpers for menu ----
+stop_and_wait_inactive() {
+  local svc="$1"
+  systemctl stop "$svc" >/dev/null 2>&1 || true
+
+  local i
+  for i in {1..10}; do
+    systemctl is-active --quiet "$svc" || return 0
+    sleep 1
+  done
+
+  # اگر گیر کرد
+  systemctl kill "$svc" >/dev/null 2>&1 || true
+  systemctl stop "$svc" >/dev/null 2>&1 || true
+  systemctl reset-failed "$svc" >/dev/null 2>&1 || true
+  return 0
+}
+
+# ---- CLI helpers ----
 cmd_list() {
   mapfile -t svcs_all < <(list_services | sort_by_priority)
   if [[ "${#svcs_all[@]}" -eq 0 ]]; then
@@ -258,23 +337,23 @@ cmd_switch() {
   local current
   current="$(get_primary_from_actives || true)"
 
-  echo "[*] Manual switch to: $target (:$tport)  [min traffic: ${TRAFFIC_MIN_KBPS}KB/s]"
+  echo "[*] Manual switch to: $target (:$tport)"
   systemctl start "$target" >/dev/null 2>&1 || true
 
   if wait_until_healthy "$target" "$tport"; then
     echo "[+] Target is healthy. Enforcing single-active policy."
     if [[ -n "${current:-}" && "$current" != "$target" ]]; then
-      systemctl stop "$current" >/dev/null 2>&1 || true
+      stop_and_wait_inactive "$current"
     fi
     for s in "${svcs_all[@]}"; do
       [[ "$s" == "$target" ]] && continue
-      if is_active "$s"; then systemctl stop "$s" >/dev/null 2>&1 || true; fi
+      if is_active "$s"; then stop_and_wait_inactive "$s"; fi
     done
     state_reset
     exit 0
   else
     echo "[-] Target did not become healthy; stopping it."
-    systemctl stop "$target" >/dev/null 2>&1 || true
+    stop_and_wait_inactive "$target"
     exit 1
   fi
 }
@@ -307,7 +386,9 @@ main() {
     backups+=("$s")
   done
 
-  log_info "Primary=$primary :$pport | Backups=${#backups[@]} | Threshold=${FAIL_THRESHOLD} | TrafficMin=${TRAFFIC_MIN_KBPS}KB/s"
+  local prev_bps cur_bps drop
+  read -r prev_bps cur_bps drop < <(traffic_drop_stats "$pport")
+  log_info "Primary=$primary :$pport | Backups=${#backups[@]} | Threshold=${FAIL_THRESHOLD} | DropCheck=10m drop>=${TRAFFIC_DROP_THRESHOLD_PCT}% | prev10m=$((prev_bps/1024))KB/s cur10m=$((cur_bps/1024))KB/s drop=${drop}%"
 
   if is_healthy "$primary" "$pport"; then
     log_ok "Primary healthy: $primary (:$pport)"
@@ -317,7 +398,7 @@ main() {
     for b in "${backups[@]}"; do
       if is_active "$b"; then
         log_warn "Stopping backup (policy): $b"
-        systemctl stop "$b" >/dev/null 2>&1 || true
+        stop_and_wait_inactive "$b"
         log_ok "Backup stopped: $b"
       fi
     done
@@ -333,10 +414,7 @@ main() {
   last_cnt=$((last_cnt + 1))
   state_write "$primary" "$last_cnt"
 
-  local bps kbps
-  bps="$(get_port_bps_instant "$pport" || echo 0)"
-  kbps=$((bps/1024))
-  log_bad "Primary unhealthy: $primary (:$pport) [count=${last_cnt}/${FAIL_THRESHOLD}] traffic=${kbps}KB/s (min=${TRAFFIC_MIN_KBPS})"
+  log_bad "Primary unhealthy: $primary (:$pport) [count=${last_cnt}/${FAIL_THRESHOLD}] prev10m=$((prev_bps/1024))KB/s cur10m=$((cur_bps/1024))KB/s drop=${drop}%"
 
   if [[ "$last_cnt" -lt "$FAIL_THRESHOLD" ]]; then
     log_warn "Failover suppressed (anti-flap). Waiting for next check."
@@ -364,7 +442,7 @@ main() {
     fi
 
     log_warn "Candidate not healthy, stopping it: $b"
-    systemctl stop "$b" >/dev/null 2>&1 || true
+    stop_and_wait_inactive "$b"
   done
 
   if [[ -z "${chosen:-}" ]]; then
@@ -373,21 +451,21 @@ main() {
   fi
 
   log_switch "Switching: stopping primary: $primary"
-  systemctl stop "$primary" >/dev/null 2>&1 || true
+  stop_and_wait_inactive "$primary"
   log_bad "Primary stopped: $primary"
 
   for b in "${backups[@]}"; do
     [[ "$b" == "$chosen" ]] && continue
     if is_active "$b"; then
       log_warn "Stopping non-chosen backup: $b"
-      systemctl stop "$b" >/dev/null 2>&1 || true
+      stop_and_wait_inactive "$b"
     fi
   done
 
   state_reset
 }
 
-# ---- dispatcher for menu ----
+# ---- dispatcher ----
 if [[ "${1:-}" == "--list" ]]; then
   cmd_list; exit 0
 elif [[ "${1:-}" == "--current" ]]; then
