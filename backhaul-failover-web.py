@@ -65,37 +65,29 @@ def get_current_primary() -> Tuple[str, str]:
 
 def get_tunnels() -> List[Dict[str, str]]:
     """
-    Parses output of:
-    SERVICE ACTIVE PORT TOML
+    Parses output of --list-raw (tab separated, no header)
     """
-    p = run([FAILOVER_BIN, "--list"], timeout=15)
+    p = run([FAILOVER_BIN, "--list-raw"], timeout=15)
     raw = p.stdout or ""
-    lines = raw.splitlines()
-    rows: List[Dict[str, str]] = []
-    if len(lines) <= 1:
-        return rows
 
-    for line in lines[1:]:
+    rows: List[Dict[str, str]] = []
+
+    for line in raw.splitlines():
         line = line.strip()
         if not line:
             continue
-        parts = line.split()
-        # SERVICE ACTIVE PORT TOML...
+
+        parts = line.split("\t")   # مهم: tab جداست
         if len(parts) >= 4:
             rows.append({
                 "service": parts[0],
                 "active": parts[1],
                 "port": parts[2],
-                "toml": " ".join(parts[3:])
+                "toml": parts[3],
             })
-        elif len(parts) >= 3:
-            rows.append({
-                "service": parts[0],
-                "active": parts[1],
-                "port": parts[2],
-                "toml": "-"
-            })
+
     return rows
+
 
 # -----------------------------
 # Traffic: read /run/backhaul-traffic/port-<PORT>.log
