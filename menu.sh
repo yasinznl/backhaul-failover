@@ -5,6 +5,8 @@ SERVICE="backhaul-failover.service"
 TIMER="backhaul-failover.timer"
 FAILOVER_BIN="/usr/local/bin/backhaul-failover.sh"
 
+WEB_SERVICE="backhaul-failover-web.service"
+
 # -------- UI helpers --------
 have_tput=0
 command -v tput >/dev/null 2>&1 && have_tput=1
@@ -23,12 +25,12 @@ hr() {
   printf "%*s\n" "$w" "" | tr " " "─"
 }
 
-VERSION="2.0"
+VERSION="2.1"
 
 render_header() {
   clear
 
-  local primary port timer_state
+  local primary port timer_state web_state
 
   primary="$("$FAILOVER_BIN" --current 2>/dev/null | awk '{print $1}' || true)"
   port="$("$FAILOVER_BIN" --current 2>/dev/null | awk '{print $2}' || true)"
@@ -37,6 +39,12 @@ render_header() {
     timer_state="${GREEN}ACTIVE${RESET}"
   else
     timer_state="${RED}INACTIVE${RESET}"
+  fi
+
+  if systemctl is-active --quiet "$WEB_SERVICE"; then
+    web_state="${GREEN}ACTIVE${RESET}"
+  else
+    web_state="${RED}INACTIVE${RESET}"
   fi
 
   echo -e "${CYA}"
@@ -52,11 +60,11 @@ render_header() {
   echo -e "${BOLD}Version:${RESET} ${VERSION}"
   echo -e "${BOLD}Primary:${RESET} ${primary:-None} ${port:+(Port :$port)}"
   echo -e "${BOLD}Timer:${RESET} $timer_state"
+  echo -e "${BOLD}Web:${RESET} $web_state"
   hr
 }
 
-# Backward compatibility: if any older code calls "title"
-title(){ render_header; }
+title(){ render_header; } # backward compatibility
 
 ok(){ echo "${GREEN}✅ $*${RESET}"; }
 warn(){ echo "${YEL}🟡 $*${RESET}"; }
@@ -72,6 +80,9 @@ show_status() {
   echo
   echo "${BOLD}${CYA}== Timer status ==${RESET}"
   systemctl status "$TIMER" --no-pager -l || true
+  echo
+  echo "${BOLD}${CYA}== Web status ==${RESET}"
+  systemctl status "$WEB_SERVICE" --no-pager -l || true
 }
 
 show_logs_tail() {
@@ -152,7 +163,7 @@ traffic_primary_live() {
   port="$(awk '{print $2}' <<<"$cur")"
 
   info "Primary: ${BOLD}${svc}${RESET}  Port: ${BOLD}:${port}${RESET}"
-  echo "${DIM}Tip: If traffic stays near zero for several minutes, automatic failover may be triggered.${RESET}"
+  echo "${DIM}Tip: Drop-based failover checks 10m traffic vs previous 10m.${RESET}"
   echo
   "$FAILOVER_BIN" --watch-traffic "$port" 1
 }
@@ -179,18 +190,38 @@ traffic_choose_live() {
   "$FAILOVER_BIN" --watch-traffic "$port" 1
 }
 
+# ---- Web panel helpers ----
+web_status() { systemctl status "$WEB_SERVICE" --no-pager -l || true; }
+web_restart() { systemctl restart "$WEB_SERVICE" || true; ok "Web panel restarted: $WEB_SERVICE"; }
+web_start() { systemctl start "$WEB_SERVICE" || true; ok "Web panel started: $WEB_SERVICE"; }
+web_stop() { systemctl stop "$WEB_SERVICE" || true; ok "Web panel stopped: $WEB_SERVICE"; }
+
+web_show_addr() {
+  local ip port
+  ip="$(hostname -I 2>/dev/null | awk '{print $1}' || echo 'SERVER_IP')"
+  port="$(systemctl show "$WEB_SERVICE" -p Environment --value 2>/dev/null \
+    | tr ' ' '\n' | awk -F= '$1=="BH_WEB_PORT"{print $2}' | tail -n1)"
+  [[ -n "${port:-}" ]] || port="8088"
+  info "Web: http://${ip}:${port}  (default user/pass: admin/admin)"
+}
+
 uninstall_all() {
-  warn "This will remove service, timer, and binaries."
+  warn "This will remove service, timer, web panel, and binaries."
   read -r -p "Type YES to uninstall: " ans
   [[ "$ans" == "YES" ]] || { bad "Cancelled."; return; }
 
   systemctl disable --now "$TIMER" >/dev/null || true
   systemctl stop "$SERVICE" >/dev/null 2>&1 || true
 
+  systemctl disable --now "$WEB_SERVICE" >/dev/null || true
+  systemctl stop "$WEB_SERVICE" >/dev/null 2>&1 || true
+
   rm -f /etc/systemd/system/backhaul-failover.service
   rm -f /etc/systemd/system/backhaul-failover.timer
+  rm -f /etc/systemd/system/backhaul-failover-web.service
   rm -f /usr/local/bin/backhaul-failover.sh
   rm -f /usr/local/bin/backhaul-failover-menu
+  rm -f /usr/local/bin/backhaul-failover-web.py
 
   systemctl daemon-reload
   systemctl reset-failed >/dev/null 2>&1 || true
@@ -223,8 +254,15 @@ while true; do
   echo "  13) Live traffic (Primary)"
   echo "  14) Live traffic (Choose tunnel)"
   echo
+  echo "${BOLD}${WHT}Web Panel${RESET}"
+  echo "  15) Web status"
+  echo "  16) Web start"
+  echo "  17) Web stop"
+  echo "  18) Web restart"
+  echo "  19) Show web address"
+  echo
   echo "${BOLD}${WHT}System${RESET}"
-  echo "  15) Uninstall"
+  echo "  20) Uninstall"
   echo "  0) Exit"
   echo
   read -r -p "Select: " choice
@@ -244,7 +282,12 @@ while true; do
     12) manage_start_stop_restart; pause ;;
     13) traffic_primary_live ;;
     14) traffic_choose_live ;;
-    15) uninstall_all ;;
+    15) web_status; pause ;;
+    16) web_start; pause ;;
+    17) web_stop; pause ;;
+    18) web_restart; pause ;;
+    19) web_show_addr; pause ;;
+    20) uninstall_all ;;
     0) exit 0 ;;
     *) bad "Invalid option"; pause ;;
   esac
