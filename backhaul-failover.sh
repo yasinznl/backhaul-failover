@@ -3,14 +3,22 @@ set -euo pipefail
 
 SERVICE_GLOB="backhaul-iran*.service"
 
+# primary failover anti-flap (per primary)
 FAIL_THRESHOLD=3
 STATE_FILE="/run/backhaul-failover.state"
 
+# fatal log detection
 FATAL_WINDOW="10 minutes ago"
 FATAL_REGEX="(panic|fatal|segfault|address already in use|bind failed|cannot bind|permission denied)"
 
+# candidate probing
 CANDIDATE_WAIT_SEC=30
 CANDIDATE_POLL_SEC=3
+
+# ---- NEW: traffic health ----
+# قطعی = زیر 100KB/s
+TRAFFIC_MIN_KBPS=100
+TRAFFIC_SAMPLE_SEC=1   # برای اندازه‌گیری نرخ، 1 ثانیه نمونه‌گیری می‌کنیم
 
 LOCKFILE="/run/backhaul-failover.lock"
 exec 9>"$LOCKFILE"
@@ -82,12 +90,58 @@ has_established_now() {
   ss -nt state established 2>/dev/null | grep -Eq "[:.]${port}\b"
 }
 
+# ---- NEW: traffic helpers (TCP only) ----
+get_port_bytes_sum_now() {
+  local port="$1"
+  # SUM = bytes_received + bytes_acked across all TCP connections with sport=:port
+  ss -tinH "( sport = :$port )" 2>/dev/null \
+    | awk '{
+        for (i=1;i<=NF;i++){
+          if ($i ~ /^bytes_received:/){ sub("bytes_received:","",$i); rx += $i }
+          else if ($i ~ /^bytes_acked:/){ sub("bytes_acked:","",$i); tx += $i }
+        }
+      }
+      END { printf "%.0f\n", (rx+tx) }'
+}
+
+get_port_bps_instant() {
+  local port="$1"
+  local t1 t2 b1 b2 dt db
+
+  b1="$(get_port_bytes_sum_now "$port" || echo 0)"
+  t1="$(date +%s)"
+  sleep "$TRAFFIC_SAMPLE_SEC"
+  b2="$(get_port_bytes_sum_now "$port" || echo 0)"
+  t2="$(date +%s)"
+
+  dt=$((t2-t1))
+  db=$((b2-b1))
+
+  if (( dt <= 0 || db < 0 )); then
+    echo 0
+    return 0
+  fi
+  echo $(( db / dt ))
+}
+
+has_min_traffic_now() {
+  local port="$1"
+  local min_bps=$(( TRAFFIC_MIN_KBPS * 1024 ))
+  local bps
+  bps="$(get_port_bps_instant "$port" || echo 0)"
+  (( bps >= min_bps ))
+}
+
 is_healthy() {
   local svc="$1" bind_port="$2"
   is_active "$svc" || return 1
   is_listening "$bind_port" || return 1
   has_fatal_errors_recently "$svc" && return 1
   has_established_now "$bind_port" || return 1
+
+  # NEW شرط قطعی ترافیکی
+  has_min_traffic_now "$bind_port" || return 1
+
   return 0
 }
 
@@ -123,6 +177,68 @@ wait_until_healthy() {
   return 1
 }
 
+# ---- CLI helpers for menu ----
+cmd_list() {
+  mapfile -t svcs_all < <(list_services | sort_by_priority)
+  if [[ "${#svcs_all[@]}" -eq 0 ]]; then
+    echo "No services match: $SERVICE_GLOB"
+    exit 0
+  fi
+
+  printf "%-35s %-8s %-7s %s\n" "SERVICE" "ACTIVE" "PORT" "TOML"
+  for s in "${svcs_all[@]}"; do
+    local toml port act
+    toml="$(get_toml_from_unit "$s")"
+    port="$(get_bind_port_from_toml "$toml" 2>/dev/null || echo "-")"
+    if is_active "$s"; then act="yes"; else act="no"; fi
+    printf "%-35s %-8s %-7s %s\n" "$s" "$act" "$port" "${toml:-"-"}"
+  done
+}
+
+cmd_start()   { systemctl start   "$1" || true; }
+cmd_stop()    { systemctl stop    "$1" || true; }
+cmd_restart() { systemctl restart "$1" || true; }
+
+cmd_switch() {
+  local target="$1"
+  [[ -n "${target:-}" ]] || { echo "Usage: $0 --switch <service>"; exit 2; }
+
+  mapfile -t svcs_all < <(list_services | sort_by_priority)
+  local found=0
+  for s in "${svcs_all[@]}"; do
+    [[ "$s" == "$target" ]] && found=1
+  done
+  (( found == 1 )) || { echo "Service not found: $target"; exit 1; }
+
+  local ttoml tport
+  ttoml="$(get_toml_from_unit "$target")"
+  tport="$(get_bind_port_from_toml "$ttoml" || true)"
+  [[ -n "${tport:-}" ]] || { echo "Cannot parse bind port for $target (toml=$ttoml)"; exit 1; }
+
+  local current
+  current="$(get_primary_from_actives || true)"
+
+  echo "[*] Manual switch to: $target (:$tport)  [min traffic: ${TRAFFIC_MIN_KBPS}KB/s]"
+  systemctl start "$target" >/dev/null 2>&1 || true
+
+  if wait_until_healthy "$target" "$tport"; then
+    echo "[+] Target is healthy. Enforcing single-active policy."
+    if [[ -n "${current:-}" && "$current" != "$target" ]]; then
+      systemctl stop "$current" >/dev/null 2>&1 || true
+    fi
+    for s in "${svcs_all[@]}"; do
+      [[ "$s" == "$target" ]] && continue
+      if is_active "$s"; then systemctl stop "$s" >/dev/null 2>&1 || true; fi
+    done
+    state_reset
+    exit 0
+  else
+    echo "[-] Target did not become healthy; stopping it."
+    systemctl stop "$target" >/dev/null 2>&1 || true
+    exit 1
+  fi
+}
+
 main() {
   mapfile -t svcs_all < <(list_services | sort_by_priority)
   if [[ "${#svcs_all[@]}" -lt 2 ]]; then
@@ -151,7 +267,7 @@ main() {
     backups+=("$s")
   done
 
-  log_info "Primary=$primary :$pport | Backups=${#backups[@]} | Threshold=${FAIL_THRESHOLD}"
+  log_info "Primary=$primary :$pport | Backups=${#backups[@]} | Threshold=${FAIL_THRESHOLD} | TrafficMin=${TRAFFIC_MIN_KBPS}KB/s"
 
   if is_healthy "$primary" "$pport"; then
     log_ok "Primary healthy: $primary (:$pport)"
@@ -177,7 +293,12 @@ main() {
   last_cnt=$((last_cnt + 1))
   state_write "$primary" "$last_cnt"
 
-  log_bad "Primary unhealthy: $primary (:$pport) [count=${last_cnt}/${FAIL_THRESHOLD}]"
+  # log why (traffic)
+  local bps kbps
+  bps="$(get_port_bps_instant "$pport" || echo 0)"
+  kbps=$((bps/1024))
+  log_bad "Primary unhealthy: $primary (:$pport) [count=${last_cnt}/${FAIL_THRESHOLD}] traffic=${kbps}KB/s (min=${TRAFFIC_MIN_KBPS})"
+
   if [[ "$last_cnt" -lt "$FAIL_THRESHOLD" ]]; then
     log_warn "Failover suppressed (anti-flap). Waiting for next check."
     exit 0
@@ -226,5 +347,18 @@ main() {
 
   state_reset
 }
+
+# ---- dispatcher for menu ----
+if [[ "${1:-}" == "--list" ]]; then
+  cmd_list; exit 0
+elif [[ "${1:-}" == "--switch" ]]; then
+  cmd_switch "${2:-}"; exit $?
+elif [[ "${1:-}" == "--start" ]]; then
+  cmd_start "${2:-}"; exit 0
+elif [[ "${1:-}" == "--stop" ]]; then
+  cmd_stop "${2:-}"; exit 0
+elif [[ "${1:-}" == "--restart" ]]; then
+  cmd_restart "${2:-}"; exit 0
+fi
 
 main "$@"
