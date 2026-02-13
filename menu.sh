@@ -1,5 +1,6 @@
 
-#!/usr/bin/env bash
+#!/bin/bash
+
 set -euo pipefail
 
 SERVICE="backhaul-failover.service"
@@ -124,7 +125,7 @@ traffic_primary_live() {
   port="$(awk '{print $2}' <<<"$cur")"
 
   info "Primary: ${BOLD}${svc}${RESET}  Port: ${BOLD}:${port}${RESET}"
-  echo "${DIM}Tip: اگر اینجا نزدیک صفر بمونه و چند دقیقه ادامه پیدا کنه، failover فعال می‌شه.${RESET}"
+  echo "${DIM}Tip: If traffic stays near zero for several minutes, automatic failover may be triggered.${RESET}"
   echo
   "$FAILOVER_BIN" --watch-traffic "$port" 1
 }
