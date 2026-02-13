@@ -199,7 +199,7 @@ uninstall_all() {
 }
 
 while true; do
-  title
+  render_header
 
   echo "${BOLD}${WHT}Monitor${RESET}"
   echo "  1) Status"
