@@ -1,5 +1,6 @@
 
-#!/usr/bin/env bash
+#!/bin/bash
+
 set -euo pipefail
 
 REPO_RAW_BASE="https://raw.githubusercontent.com/yasinznl/backhaul-failover/main"
