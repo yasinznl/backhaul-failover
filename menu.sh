@@ -1,7 +1,4 @@
-# =========================================
-# FILE: menu.sh
-# PATH (installed): /usr/local/bin/backhaul-failover-menu
-# =========================================
+
 #!/usr/bin/env bash
 set -euo pipefail
 
