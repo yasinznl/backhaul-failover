@@ -1,3 +1,7 @@
+# =========================================
+# FILE: menu.sh
+# PATH (installed): /usr/local/bin/backhaul-failover-menu
+# =========================================
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -5,94 +9,155 @@ SERVICE="backhaul-failover.service"
 TIMER="backhaul-failover.timer"
 FAILOVER_BIN="/usr/local/bin/backhaul-failover.sh"
 
-green(){ printf "\033[32m%s\033[0m\n" "$*"; }
-red(){ printf "\033[31m%s\033[0m\n" "$*"; }
-yellow(){ printf "\033[33m%s\033[0m\n" "$*"; }
-cyan(){ printf "\033[36m%s\033[0m\n" "$*"; }
+# -------- UI helpers --------
+have_tput=0
+command -v tput >/dev/null 2>&1 && have_tput=1
 
-pause(){ read -r -p "Press Enter to continue..." _; }
+if [[ "$have_tput" == "1" && -t 1 ]]; then
+  BOLD="$(tput bold)"; DIM="$(tput dim)"; RESET="$(tput sgr0)"
+  RED="$(tput setaf 1)"; GREEN="$(tput setaf 2)"; YEL="$(tput setaf 3)"; CYA="$(tput setaf 6)"; WHT="$(tput setaf 7)"
+else
+  BOLD=""; DIM=""; RESET=""
+  RED=""; GREEN=""; YEL=""; CYA=""; WHT=""
+fi
+
+hr() {
+  local w
+  w=$(tput cols 2>/dev/null || echo 80)
+  printf "%*s\n" "$w" "" | tr " " "─"
+}
+
+title() {
+  clear
+  echo "${BOLD}${CYA}Backhaul Failover Manager${RESET}  ${DIM}(Ctrl+C anytime in live views)${RESET}"
+  hr
+}
+
+ok(){ echo "${GREEN}✅ $*${RESET}"; }
+warn(){ echo "${YEL}🟡 $*${RESET}"; }
+bad(){ echo "${RED}❌ $*${RESET}"; }
+info(){ echo "${CYA}ℹ️  $*${RESET}"; }
+
+pause(){ echo; read -r -p "Press Enter to continue..." _; }
 
 show_status() {
   echo
-  cyan "== Status =="
+  echo "${BOLD}${CYA}== Service status ==${RESET}"
   systemctl status "$SERVICE" --no-pager -l || true
   echo
+  echo "${BOLD}${CYA}== Timer status ==${RESET}"
   systemctl status "$TIMER" --no-pager -l || true
-}
-
-show_logs_live() {
-  echo
-  cyan "== Live Logs (Ctrl+C to exit) =="
-  journalctl -u "$SERVICE" -f -o cat
 }
 
 show_logs_tail() {
   echo
-  cyan "== Last 200 lines =="
+  echo "${BOLD}${CYA}== Last 200 lines ==${RESET}"
   journalctl -u "$SERVICE" -n 200 --no-pager -o cat
 }
 
-start_timer() { systemctl start "$TIMER"; green "✅ Timer started: $TIMER"; }
-stop_timer() { systemctl stop "$TIMER" || true; green "🛑 Timer stopped: $TIMER"; }
-restart_timer() { systemctl restart "$TIMER"; green "🔁 Timer restarted: $TIMER"; }
-run_once() { systemctl start "$SERVICE" || true; green "▶️ Ran once: $SERVICE"; }
+show_logs_live() {
+  echo
+  echo "${BOLD}${CYA}== Live logs (Ctrl+C to exit) ==${RESET}"
+  journalctl -u "$SERVICE" -f -o cat
+}
 
-enable_autostart() { systemctl enable --now "$TIMER" >/dev/null; green "✅ Enabled + started: $TIMER"; }
-disable_autostart() { systemctl disable --now "$TIMER" >/dev/null || true; green "🛑 Disabled + stopped: $TIMER"; }
+run_once() {
+  systemctl start "$SERVICE" || true
+  ok "Ran once: $SERVICE"
+}
+
+start_timer() { systemctl start "$TIMER" || true; ok "Timer started: $TIMER"; }
+stop_timer() { systemctl stop "$TIMER" || true; ok "Timer stopped: $TIMER"; }
+restart_timer() { systemctl restart "$TIMER" || true; ok "Timer restarted: $TIMER"; }
+
+enable_autostart() { systemctl enable --now "$TIMER" >/dev/null; ok "Enabled + started: $TIMER"; }
+disable_autostart() { systemctl disable --now "$TIMER" >/dev/null || true; ok "Disabled + stopped: $TIMER"; }
 
 list_tunnels() {
   echo
-  cyan "== Tunnels =="
+  echo "${BOLD}${CYA}== Tunnels ==${RESET}"
   "$FAILOVER_BIN" --list || true
 }
 
 manual_switch() {
   echo
-  cyan "== Manual switch =="
+  echo "${BOLD}${CYA}== Manual switch ==${RESET}"
   "$FAILOVER_BIN" --list || true
   echo
-  read -r -p "Enter service name to switch to (e.g. backhaul-iran1.service): " svc
-  if [[ -z "${svc:-}" ]]; then red "No service entered."; return; fi
-  "$FAILOVER_BIN" --switch "$svc" || red "Switch failed."
+  read -r -p "Enter service name to switch to (e.g. backhaul-iran407.service): " svc
+  [[ -n "${svc:-}" ]] || { bad "No service entered."; return; }
+  "$FAILOVER_BIN" --switch "$svc" && ok "Switched to $svc" || bad "Switch failed."
 }
 
-manage_start() {
+manage_start_stop_restart() {
   echo
-  cyan "== Start tunnel =="
+  echo "${BOLD}${CYA}== Manage tunnel ==${RESET}"
   "$FAILOVER_BIN" --list || true
   echo
-  read -r -p "Service to START: " svc
-  [[ -n "${svc:-}" ]] || { red "No service entered."; return; }
-  "$FAILOVER_BIN" --start "$svc" || true
-  green "Started: $svc"
+  read -r -p "Service name: " svc
+  [[ -n "${svc:-}" ]] || { bad "No service entered."; return; }
+
+  echo
+  echo "1) Start"
+  echo "2) Stop"
+  echo "3) Restart"
+  echo
+  read -r -p "Select: " a
+  case "$a" in
+    1) "$FAILOVER_BIN" --start "$svc" || true; ok "Started: $svc" ;;
+    2) "$FAILOVER_BIN" --stop "$svc" || true; ok "Stopped: $svc" ;;
+    3) "$FAILOVER_BIN" --restart "$svc" || true; ok "Restarted: $svc" ;;
+    *) bad "Invalid option" ;;
+  esac
 }
 
-manage_stop() {
+traffic_primary_live() {
   echo
-  cyan "== Stop tunnel =="
-  "$FAILOVER_BIN" --list || true
+  echo "${BOLD}${CYA}== Live traffic (Primary) ==${RESET}"
+
+  local cur
+  cur="$("$FAILOVER_BIN" --current 2>/dev/null || true)"
+  if [[ -z "${cur:-}" ]]; then
+    bad "No active primary detected."
+    return
+  fi
+
+  local svc port
+  svc="$(awk '{print $1}' <<<"$cur")"
+  port="$(awk '{print $2}' <<<"$cur")"
+
+  info "Primary: ${BOLD}${svc}${RESET}  Port: ${BOLD}:${port}${RESET}"
+  echo "${DIM}Tip: اگر اینجا نزدیک صفر بمونه و چند دقیقه ادامه پیدا کنه، failover فعال می‌شه.${RESET}"
   echo
-  read -r -p "Service to STOP: " svc
-  [[ -n "${svc:-}" ]] || { red "No service entered."; return; }
-  "$FAILOVER_BIN" --stop "$svc" || true
-  green "Stopped: $svc"
+  "$FAILOVER_BIN" --watch-traffic "$port" 1
 }
 
-manage_restart() {
+traffic_choose_live() {
   echo
-  cyan "== Restart tunnel =="
+  echo "${BOLD}${CYA}== Live traffic (Choose tunnel) ==${RESET}"
   "$FAILOVER_BIN" --list || true
   echo
-  read -r -p "Service to RESTART: " svc
-  [[ -n "${svc:-}" ]] || { red "No service entered."; return; }
-  "$FAILOVER_BIN" --restart "$svc" || true
-  green "Restarted: $svc"
+  read -r -p "Enter service name (e.g. backhaul-iran407.service): " svc
+  [[ -n "${svc:-}" ]] || { bad "No service entered."; return; }
+
+  local line port
+  line="$("$FAILOVER_BIN" --list 2>/dev/null | awk -v s="$svc" '$1==s {print $0}' | head -n1 || true)"
+  port="$(awk '{print $3}' <<<"$line" 2>/dev/null || true)"
+
+  if [[ -z "${port:-}" || "$port" == "-" ]]; then
+    bad "Could not determine port for: $svc"
+    return
+  fi
+
+  info "Service: ${BOLD}${svc}${RESET}  Port: ${BOLD}:${port}${RESET}"
+  echo
+  "$FAILOVER_BIN" --watch-traffic "$port" 1
 }
 
 uninstall_all() {
-  yellow "This will remove service, timer, and binaries."
+  warn "This will remove service, timer, and binaries."
   read -r -p "Type YES to uninstall: " ans
-  if [[ "$ans" != "YES" ]]; then red "Cancelled."; return; fi
+  [[ "$ans" == "YES" ]] || { bad "Cancelled."; return; }
 
   systemctl disable --now "$TIMER" >/dev/null || true
   systemctl stop "$SERVICE" >/dev/null 2>&1 || true
@@ -104,50 +169,58 @@ uninstall_all() {
 
   systemctl daemon-reload
   systemctl reset-failed >/dev/null 2>&1 || true
-
-  green "✅ Uninstalled."
+  ok "Uninstalled."
   exit 0
 }
 
 while true; do
-  clear
-  cyan "Backhaul Failover Manager"
-  echo "1) Status"
-  echo "2) Run once (service)"
-  echo "3) Start timer"
-  echo "4) Stop timer"
-  echo "5) Restart timer"
-  echo "6) Logs (tail)"
-  echo "7) Logs (live)"
-  echo "8) Enable autostart"
-  echo "9) Disable autostart"
-  echo "10) Uninstall"
-  echo "11) List tunnels"
-  echo "12) Manual switch (pick service)"
-  echo "13) Start a tunnel service"
-  echo "14) Stop a tunnel service"
-  echo "15) Restart a tunnel service"
-  echo "0) Exit"
+  title
+
+  echo "${BOLD}${WHT}Monitor${RESET}"
+  echo "  1) Status"
+  echo "  2) Run once (service)"
+  echo "  3) Logs (tail)"
+  echo "  4) Logs (live)"
+  echo
+  echo "${BOLD}${WHT}Scheduler${RESET}"
+  echo "  5) Start timer"
+  echo "  6) Stop timer"
+  echo "  7) Restart timer"
+  echo "  8) Enable autostart"
+  echo "  9) Disable autostart"
+  echo
+  echo "${BOLD}${WHT}Tunnels${RESET}"
+  echo "  10) List tunnels"
+  echo "  11) Manual switch (pick service)"
+  echo "  12) Manage tunnel (start/stop/restart)"
+  echo
+  echo "${BOLD}${WHT}Traffic${RESET}"
+  echo "  13) Live traffic (Primary)"
+  echo "  14) Live traffic (Choose tunnel)"
+  echo
+  echo "${BOLD}${WHT}System${RESET}"
+  echo "  15) Uninstall"
+  echo "  0) Exit"
   echo
   read -r -p "Select: " choice
 
   case "$choice" in
     1) show_status; pause ;;
     2) run_once; pause ;;
-    3) start_timer; pause ;;
-    4) stop_timer; pause ;;
-    5) restart_timer; pause ;;
-    6) show_logs_tail; pause ;;
-    7) show_logs_live ;;
+    3) show_logs_tail; pause ;;
+    4) show_logs_live ;;
+    5) start_timer; pause ;;
+    6) stop_timer; pause ;;
+    7) restart_timer; pause ;;
     8) enable_autostart; pause ;;
     9) disable_autostart; pause ;;
-    10) uninstall_all ;;
-    11) list_tunnels; pause ;;
-    12) manual_switch; pause ;;
-    13) manage_start; pause ;;
-    14) manage_stop; pause ;;
-    15) manage_restart; pause ;;
+    10) list_tunnels; pause ;;
+    11) manual_switch; pause ;;
+    12) manage_start_stop_restart; pause ;;
+    13) traffic_primary_live ;;
+    14) traffic_choose_live ;;
+    15) uninstall_all ;;
     0) exit 0 ;;
-    *) red "Invalid option"; pause ;;
+    *) bad "Invalid option"; pause ;;
   esac
 done
