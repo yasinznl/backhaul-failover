@@ -25,11 +25,38 @@ hr() {
   printf "%*s\n" "$w" "" | tr " " "─"
 }
 
-title() {
+VERSION="2.0"
+
+render_header() {
   clear
-  echo "${BOLD}${CYA}Backhaul Failover Manager${RESET}  ${DIM}(Ctrl+C anytime in live views)${RESET}"
+
+  local primary port timer_state
+
+  primary="$("$FAILOVER_BIN" --current 2>/dev/null | awk '{print $1}' || true)"
+  port="$("$FAILOVER_BIN" --current 2>/dev/null | awk '{print $2}' || true)"
+
+  if systemctl is-active --quiet "$TIMER"; then
+    timer_state="${GREEN}ACTIVE${RESET}"
+  else
+    timer_state="${RED}INACTIVE${RESET}"
+  fi
+
+  echo -e "${CYA}"
+  echo "██████╗  █████╗  ██████╗██╗  ██╗██╗  ██╗ █████╗ ██╗   ██╗██╗     "
+  echo "██╔══██╗██╔══██╗██╔════╝██║ ██╔╝██║  ██║██╔══██╗██║   ██║██║     "
+  echo "██████╔╝███████║██║     █████╔╝ ███████║███████║██║   ██║██║     "
+  echo "██╔══██╗██╔══██║██║     ██╔═██╗ ██╔══██║██╔══██║██║   ██║██║     "
+  echo "██████╔╝██║  ██║╚██████╗██║  ██╗██║  ██║██║  ██║╚██████╔╝███████╗"
+  echo "╚═════╝ ╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝ ╚══════╝"
+  echo -e "${RESET}"
+
+  hr
+  echo -e "${BOLD}Version:${RESET} ${VERSION}"
+  echo -e "${BOLD}Primary:${RESET} ${primary:-None} ${port:+(Port :$port)}"
+  echo -e "${BOLD}Timer:${RESET} $timer_state"
   hr
 }
+
 
 ok(){ echo "${GREEN}✅ $*${RESET}"; }
 warn(){ echo "${YEL}🟡 $*${RESET}"; }
