@@ -34,17 +34,14 @@ fetch() {
 
 normalize_bash_file() {
   local f="$1"
+  # Fix CRLF + remove UTF-8 BOM + ensure a valid bash shebang
   sed -i 's/\r$//' "$f"
   sed -i '1s/^\xEF\xBB\xBF//' "$f"
   sed -i '1s|^#!.*$|#!/usr/bin/env bash|' "$f"
+  # If file somehow starts without a shebang, force it
   if ! head -n1 "$f" | grep -q '^#!'; then
     sed -i '1i #!/usr/bin/env bash' "$f"
   fi
-}
-
-validate_bash() {
-  local f="$1"
-  bash -n "$f" >/dev/null
 }
 
 normalize_text_file() {
@@ -53,10 +50,17 @@ normalize_text_file() {
   sed -i '1s/^\xEF\xBB\xBF//' "$f"
 }
 
+validate_bash() {
+  local f="$1"
+  bash -n "$f" >/dev/null
+}
+
 install_flask_if_needed() {
   if python3 -c "import flask" >/dev/null 2>&1; then
     return 0
   fi
+
+  echo "[*] Flask not found. Installing..."
 
   if command -v apt-get >/dev/null 2>&1; then
     apt-get update -y >/dev/null
@@ -87,34 +91,32 @@ need_cmd python3
 
 mkdir -p "$BIN_DIR"
 
-# -----------------------
-# Download scripts
-# -----------------------
+echo "[*] Downloading scripts..."
 
-# backhaul-failover.sh
+# ---- backhaul-failover.sh ----
 fetch "${REPO_RAW_BASE}/backhaul-failover.sh" "${FAILOVER_BIN}.new"
 normalize_bash_file "${FAILOVER_BIN}.new"
 chmod 755 "${FAILOVER_BIN}.new"
 validate_bash "${FAILOVER_BIN}.new"
 mv -f "${FAILOVER_BIN}.new" "$FAILOVER_BIN"
 
-# menu -> backhaul-failover-menu
+# ---- menu ----
 fetch "${REPO_RAW_BASE}/menu.sh" "${MENU_BIN}.new"
 normalize_bash_file "${MENU_BIN}.new"
 chmod 755 "${MENU_BIN}.new"
 validate_bash "${MENU_BIN}.new"
 mv -f "${MENU_BIN}.new" "$MENU_BIN"
 
-# web panel python
-fetch "${REPO_RAW_BASE}/web/backhaul-failover-web.py" "${WEB_BIN}.new"
+# ---- web panel (IMPORTANT: file is in repo root) ----
+fetch "${REPO_RAW_BASE}/backhaul-failover-web.py" "${WEB_BIN}.new"
 normalize_text_file "${WEB_BIN}.new"
 chmod 755 "${WEB_BIN}.new"
 python3 -m py_compile "${WEB_BIN}.new" >/dev/null 2>&1 || { echo "ERROR: python syntax error in web file"; exit 1; }
 mv -f "${WEB_BIN}.new" "$WEB_BIN"
 
-# -----------------------
-# Download systemd units
-# -----------------------
+echo "[*] Downloading systemd units..."
+
+# ---- systemd units ----
 fetch "${REPO_RAW_BASE}/systemd/backhaul-failover.service" "${SERVICE_UNIT}.new"
 normalize_text_file "${SERVICE_UNIT}.new"
 mv -f "${SERVICE_UNIT}.new" "$SERVICE_UNIT"
@@ -127,7 +129,6 @@ fetch "${REPO_RAW_BASE}/systemd/backhaul-failover-web.service" "${WEB_UNIT}.new"
 normalize_text_file "${WEB_UNIT}.new"
 mv -f "${WEB_UNIT}.new" "$WEB_UNIT"
 
-# dependencies
 install_flask_if_needed
 
 systemctl daemon-reload
