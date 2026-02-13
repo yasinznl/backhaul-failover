@@ -1,3 +1,7 @@
+# =========================================
+# FILE: backhaul-failover.sh
+# PATH: /usr/local/bin/backhaul-failover.sh
+# =========================================
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -15,9 +19,9 @@ FATAL_REGEX="(panic|fatal|segfault|address already in use|bind failed|cannot bin
 CANDIDATE_WAIT_SEC=30
 CANDIDATE_POLL_SEC=3
 
-# ---- NEW: traffic health ----
-# قطعی = زیر 100KB/s
-TRAFFIC_MIN_KBPS=100
+# ---- Traffic health ----
+# قطعی = زیر 50KB/s
+TRAFFIC_MIN_KBPS=50
 TRAFFIC_SAMPLE_SEC=1   # برای اندازه‌گیری نرخ، 1 ثانیه نمونه‌گیری می‌کنیم
 
 LOCKFILE="/run/backhaul-failover.lock"
@@ -90,10 +94,9 @@ has_established_now() {
   ss -nt state established 2>/dev/null | grep -Eq "[:.]${port}\b"
 }
 
-# ---- NEW: traffic helpers (TCP only) ----
+# ---- Traffic helpers (TCP only) ----
 get_port_bytes_sum_now() {
   local port="$1"
-  # SUM = bytes_received + bytes_acked across all TCP connections with sport=:port
   ss -tinH "( sport = :$port )" 2>/dev/null \
     | awk '{
         for (i=1;i<=NF;i++){
@@ -138,10 +141,7 @@ is_healthy() {
   is_listening "$bind_port" || return 1
   has_fatal_errors_recently "$svc" && return 1
   has_established_now "$bind_port" || return 1
-
-  # NEW شرط قطعی ترافیکی
   has_min_traffic_now "$bind_port" || return 1
-
   return 0
 }
 
@@ -192,6 +192,49 @@ cmd_list() {
     port="$(get_bind_port_from_toml "$toml" 2>/dev/null || echo "-")"
     if is_active "$s"; then act="yes"; else act="no"; fi
     printf "%-35s %-8s %-7s %s\n" "$s" "$act" "$port" "${toml:-"-"}"
+  done
+}
+
+cmd_current() {
+  local primary ptoml pport
+  primary="$(get_primary_from_actives || true)"
+  [[ -n "${primary:-}" ]] || { echo ""; exit 1; }
+
+  ptoml="$(get_toml_from_unit "$primary")"
+  pport="$(get_bind_port_from_toml "$ptoml" || true)"
+  [[ -n "${pport:-}" ]] || { echo ""; exit 1; }
+
+  echo "$primary $pport"
+}
+
+cmd_watch_traffic() {
+  local port="${1:-}"
+  local interval="${2:-1}"
+  [[ -n "${port:-}" ]] || { echo "Usage: $0 --watch-traffic <port> [interval]"; exit 2; }
+
+  local prev_b prev_t cur_b cur_t dt db bps kb mb
+  prev_b="$(get_port_bytes_sum_now "$port" || echo 0)"
+  prev_t="$(date +%s)"
+
+  echo "Watching traffic on TCP sport=:${port}  (Ctrl+C to exit)"
+  while true; do
+    sleep "$interval"
+    cur_b="$(get_port_bytes_sum_now "$port" || echo 0)"
+    cur_t="$(date +%s)"
+    dt=$((cur_t - prev_t))
+    db=$((cur_b - prev_b))
+
+    if (( dt > 0 && db >= 0 )); then
+      bps=$((db/dt))
+      kb=$((bps/1024))
+      mb=$((bps/1024/1024))
+      printf ":%s  %10s B/s  (%7s KB/s)  (%5s MB/s)\n" "$port" "$bps" "$kb" "$mb"
+    else
+      printf ":%s  N/A\n" "$port"
+    fi
+
+    prev_b=$cur_b
+    prev_t=$cur_t
   done
 }
 
@@ -293,7 +336,6 @@ main() {
   last_cnt=$((last_cnt + 1))
   state_write "$primary" "$last_cnt"
 
-  # log why (traffic)
   local bps kbps
   bps="$(get_port_bps_instant "$pport" || echo 0)"
   kbps=$((bps/1024))
@@ -351,6 +393,10 @@ main() {
 # ---- dispatcher for menu ----
 if [[ "${1:-}" == "--list" ]]; then
   cmd_list; exit 0
+elif [[ "${1:-}" == "--current" ]]; then
+  cmd_current; exit 0
+elif [[ "${1:-}" == "--watch-traffic" ]]; then
+  cmd_watch_traffic "${2:-}" "${3:-1}"; exit 0
 elif [[ "${1:-}" == "--switch" ]]; then
   cmd_switch "${2:-}"; exit $?
 elif [[ "${1:-}" == "--start" ]]; then
