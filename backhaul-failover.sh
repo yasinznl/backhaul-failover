@@ -475,9 +475,40 @@ main() {
   state_reset
 }
 
+cmd_list_raw() {
+  mapfile -t svcs_all < <(list_services | sort_by_priority)
+  for s in "${svcs_all[@]}"; do
+    local toml port act
+    toml="$(get_toml_from_unit "$s")"
+    port="$(get_bind_port_from_toml "$toml" 2>/dev/null || echo "-")"
+    if is_active "$s"; then act="yes"; else act="no"; fi
+    printf "%s\t%s\t%s\t%s\n" "$s" "$act" "$port" "${toml:-"-"}"
+  done
+}
+
+cmd_list() {
+  mapfile -t svcs_all < <(list_services | sort_by_priority)
+  if [[ "${#svcs_all[@]}" -eq 0 ]]; then
+    echo "No services match: $SERVICE_GLOB"
+    exit 0
+  fi
+
+  printf "%-35s %-8s %-7s %s\n" "SERVICE" "ACTIVE" "PORT" "TOML"
+  for s in "${svcs_all[@]}"; do
+    local toml port act
+    toml="$(get_toml_from_unit "$s")"
+    port="$(get_bind_port_from_toml "$toml" 2>/dev/null || echo "-")"
+    if is_active "$s"; then act="yes"; else act="no"; fi
+    printf "%-35s %-8s %-7s %s\n" "$s" "$act" "$port" "${toml:-"-"}"
+  done
+}
+
+
 # ---- dispatcher ----
 if [[ "${1:-}" == "--list" ]]; then
   cmd_list; exit 0
+elif [[ "${1:-}" == "--list-raw" ]]; then
+  cmd_list_raw; exit 0
 elif [[ "${1:-}" == "--current" ]]; then
   cmd_current; exit 0
 elif [[ "${1:-}" == "--watch-traffic" ]]; then
@@ -493,3 +524,4 @@ elif [[ "${1:-}" == "--restart" ]]; then
 fi
 
 main "$@"
+
