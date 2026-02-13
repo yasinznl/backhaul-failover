@@ -758,7 +758,6 @@ HTML = r"""
           responsive: true,
           maintainAspectRatio: false,  // required for fixed chartWrap height
           animation: false,            // prevents UI lag/crash
-          parsing: false,
           normalized: true,
           plugins: {
             legend: { labels: { color: "#9fb0d8" } },
@@ -920,7 +919,7 @@ HTML = r"""
           const d = new Date(x.t * 1000);
           return d.toLocaleTimeString(undefined, {hour:"2-digit", minute:"2-digit", second:"2-digit"});
         });
-        const data = series.map(x => x.bps);
+        const data = series.map(x => Number(x.bps)).map(v => (Number.isFinite(v) ? v : 0));
 
         // avoid redundant heavy updates
         const key = String(labels.length) + ":" + (labels[labels.length-1] || "");
