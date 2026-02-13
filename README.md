@@ -1,10 +1,5 @@
-=====================================================================
- BACKHAUL FAILOVER (Traffic-Aware) – Production Edition
-=====================================================================
+BACKHAUL FAILOVER (Traffic-Aware) – Production Edition
 
----------------------------------------------------------------------
- OVERVIEW
----------------------------------------------------------------------
 
 This system monitors multiple systemd services matching:
 
