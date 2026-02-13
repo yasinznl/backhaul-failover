@@ -1,0 +1,16 @@
+[Unit]
+Description=Backhaul Failover Web Panel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=BH_WEB_USER=admin
+Environment=BH_WEB_PASS=admin
+Environment=BH_WEB_PORT=8088
+ExecStart=/usr/bin/env python3 /usr/local/bin/backhaul-failover-web.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
