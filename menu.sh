@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-
 set -euo pipefail
 
 SERVICE="backhaul-failover.service"
@@ -56,6 +55,8 @@ render_header() {
   hr
 }
 
+# Backward compatibility: if any older code calls "title"
+title(){ render_header; }
 
 ok(){ echo "${GREEN}✅ $*${RESET}"; }
 warn(){ echo "${YEL}🟡 $*${RESET}"; }
