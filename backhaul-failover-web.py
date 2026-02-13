@@ -1,80 +1,59 @@
 #!/usr/bin/env python3
 import os
 import time
-import json
-import shlex
 import subprocess
-from typing import List, Tuple, Optional
-from flask import Flask, request, Response, redirect, url_for, render_template_string, jsonify
+from typing import List, Dict, Tuple
+from flask import Flask, request, Response, jsonify, render_template_string
 
-# -----------------------
-# Config
-# -----------------------
-FAILOVER_BIN = "/usr/local/bin/backhaul-failover.sh"
-SERVICE = "backhaul-failover.service"
-TIMER = "backhaul-failover.timer"
-WEB_SERVICE = "backhaul-failover-web.service"
+# -----------------------------
+# Configuration
+# -----------------------------
+FAILOVER_BIN = os.environ.get("BH_FAILOVER_BIN", "/usr/local/bin/backhaul-failover.sh")
+SERVICE_FAILOVER = os.environ.get("BH_FAILOVER_SERVICE", "backhaul-failover.service")
+TIMER_FAILOVER = os.environ.get("BH_FAILOVER_TIMER", "backhaul-failover.timer")
+SERVICE_WEB = os.environ.get("BH_WEB_SERVICE", "backhaul-failover-web.service")
 
-USER = os.environ.get("BH_WEB_USER", "admin")
-PASS = os.environ.get("BH_WEB_PASS", "admin")
-PORT = int(os.environ.get("BH_WEB_PORT", "8088"))
+# Basic Auth
+WEB_USER = os.environ.get("BH_WEB_USER", "admin")
+WEB_PASS = os.environ.get("BH_WEB_PASS", "admin")
 
+# Listen
+WEB_HOST = os.environ.get("BH_WEB_HOST", "0.0.0.0")
+WEB_PORT = int(os.environ.get("BH_WEB_PORT", "8088"))
+
+# Traffic log dir from your failover script
 TRAFFIC_DIR = os.environ.get("BH_TRAFFIC_DIR", "/run/backhaul-traffic")
-METRICS_POINTS = int(os.environ.get("BH_METRICS_POINTS", "180"))  # ~180 minutes if 1/min, or ~6 min if 2s sample
-METRICS_POLL_SEC = float(os.environ.get("BH_METRICS_POLL_SEC", "2.0"))  # browser polling interval (JS)
 
-# -----------------------
-# App
-# -----------------------
+# How many points to return to chart (hard cap)
+MAX_SERIES_POINTS = int(os.environ.get("BH_MAX_SERIES_POINTS", "240"))  # keep small for stability
+
+# -----------------------------
+# Flask app
+# -----------------------------
 app = Flask(__name__)
 
-def run(cmd: List[str], timeout: int = 15) -> subprocess.CompletedProcess:
+def run(cmd: List[str], timeout: int = 20) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout)
 
 def is_active(unit: str) -> bool:
-    return run(["systemctl", "is-active", "--quiet", unit]).returncode == 0
+    return subprocess.run(["systemctl", "is-active", "--quiet", unit]).returncode == 0
 
-def ok_auth(auth) -> bool:
-    return auth and auth.username == USER and auth.password == PASS
+def auth_ok() -> bool:
+    auth = request.authorization
+    return bool(auth and auth.username == WEB_USER and auth.password == WEB_PASS)
 
-def need_auth():
-    return Response("Auth required", 401, {"WWW-Authenticate": "Basic realm='Backhaul Panel'"})
+def require_auth():
+    return Response("Authentication required", 401, {"WWW-Authenticate": "Basic realm='Backhaul Command Center'"})
 
 @app.before_request
-def protect():
-    # basic auth everywhere
-    auth = request.authorization
-    if not ok_auth(auth):
-        return need_auth()
+def guard():
+    if not auth_ok():
+        return require_auth()
 
-# -----------------------
-# Helpers: Tunnels
-# -----------------------
-def failover_list() -> Tuple[List[Tuple[str, str, str, str]], str]:
-    """
-    Returns rows: [(service, active, port, toml)]
-    and raw output.
-    """
-    p = run([FAILOVER_BIN, "--list"], timeout=15)
-    raw = p.stdout or ""
-    rows: List[Tuple[str, str, str, str]] = []
-    lines = raw.splitlines()
-    if len(lines) <= 1:
-        return rows, raw
-
-    # Expect header: SERVICE ACTIVE PORT TOML
-    for line in lines[1:]:
-        parts = line.split()
-        if len(parts) >= 4:
-            svc, active, port = parts[0], parts[1], parts[2]
-            toml = " ".join(parts[3:])
-            rows.append((svc, active, port, toml))
-        elif len(parts) >= 3:
-            svc, active, port = parts[0], parts[1], parts[2]
-            rows.append((svc, active, port, "-"))
-    return rows, raw
-
-def failover_current() -> Tuple[str, str]:
+# -----------------------------
+# Tunnels parsing
+# -----------------------------
+def get_current_primary() -> Tuple[str, str]:
     p = run([FAILOVER_BIN, "--current"], timeout=10)
     s = (p.stdout or "").strip()
     if not s:
@@ -84,43 +63,75 @@ def failover_current() -> Tuple[str, str]:
         return parts[0], parts[1]
     return parts[0], "-"
 
-# -----------------------
-# Helpers: Traffic timeseries
-# -----------------------
+def get_tunnels() -> List[Dict[str, str]]:
+    """
+    Parses output of:
+    SERVICE ACTIVE PORT TOML
+    """
+    p = run([FAILOVER_BIN, "--list"], timeout=15)
+    raw = p.stdout or ""
+    lines = raw.splitlines()
+    rows: List[Dict[str, str]] = []
+    if len(lines) <= 1:
+        return rows
+
+    for line in lines[1:]:
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split()
+        # SERVICE ACTIVE PORT TOML...
+        if len(parts) >= 4:
+            rows.append({
+                "service": parts[0],
+                "active": parts[1],
+                "port": parts[2],
+                "toml": " ".join(parts[3:])
+            })
+        elif len(parts) >= 3:
+            rows.append({
+                "service": parts[0],
+                "active": parts[1],
+                "port": parts[2],
+                "toml": "-"
+            })
+    return rows
+
+# -----------------------------
+# Traffic: read /run/backhaul-traffic/port-<PORT>.log
+# Format: "unix_ts bytes_sum"
+# -----------------------------
 def traffic_log_path(port: str) -> str:
     return os.path.join(TRAFFIC_DIR, f"port-{port}.log")
 
-def read_traffic_points(port: str, max_points: int = 200) -> List[Tuple[int, int]]:
-    """
-    Returns list of (ts, bytes_sum) from /run/backhaul-traffic/port-PORT.log
-    """
-    path = traffic_log_path(port)
+def read_last_lines(path: str, max_lines: int) -> List[str]:
     if not os.path.exists(path):
         return []
-    pts: List[Tuple[int, int]] = []
     try:
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            lines = f.readlines()[-max_points:]
-        for ln in lines:
-            ln = ln.strip()
-            if not ln:
-                continue
-            parts = ln.split()
-            if len(parts) >= 2:
-                try:
-                    ts = int(float(parts[0]))
-                    b = int(float(parts[1]))
-                    pts.append((ts, b))
-                except Exception:
-                    continue
+            lines = f.readlines()
+        return lines[-max_lines:]
     except Exception:
         return []
+
+def parse_points(lines: List[str]) -> List[Tuple[int, int]]:
+    pts: List[Tuple[int, int]] = []
+    for ln in lines:
+        ln = ln.strip()
+        if not ln:
+            continue
+        parts = ln.split()
+        if len(parts) < 2:
+            continue
+        try:
+            ts = int(float(parts[0]))
+            b = int(float(parts[1]))
+            pts.append((ts, b))
+        except Exception:
+            continue
     return pts
 
 def points_to_bps(points: List[Tuple[int, int]]) -> List[Tuple[int, float]]:
-    """
-    Convert (ts, bytes) to (ts, bytes_per_sec) using discrete derivative.
-    """
     if len(points) < 2:
         return []
     out: List[Tuple[int, float]] = []
@@ -128,11 +139,10 @@ def points_to_bps(points: List[Tuple[int, int]]) -> List[Tuple[int, float]]:
     for ts, b in points[1:]:
         dt = ts - prev_ts
         db = b - prev_b
+        prev_ts, prev_b = ts, b
         if dt <= 0 or db < 0:
-            prev_ts, prev_b = ts, b
             continue
         out.append((ts, db / dt))
-        prev_ts, prev_b = ts, b
     return out
 
 def human_bps(bps: float) -> str:
@@ -147,34 +157,43 @@ def human_bps(bps: float) -> str:
     gb = mb / 1024
     return f"{gb:.2f} GB/s"
 
-# -----------------------
-# Live logs via SSE
-# -----------------------
-def sse_format(data: str, event: Optional[str] = None) -> str:
-    # Minimal SSE message
-    msg = ""
-    if event:
-        msg += f"event: {event}\n"
-    for line in data.splitlines():
-        msg += f"data: {line}\n"
-    msg += "\n"
-    return msg
+def avg(values: List[float]) -> float:
+    if not values:
+        return 0.0
+    return sum(values) / len(values)
+
+# -----------------------------
+# Logs: Tail + Live (SSE)
+# -----------------------------
+def sse(data: str) -> str:
+    # Keep it simple
+    return "data: " + data.replace("\n", "\\n") + "\n\n"
+
+@app.get("/api/logs/tail")
+def api_logs_tail():
+    unit = request.args.get("unit", SERVICE_FAILOVER)
+    lines = int(request.args.get("lines", "250"))
+    try:
+        txt = run(["journalctl", "-u", unit, "-n", str(lines), "--no-pager", "-o", "cat"], timeout=12).stdout or ""
+        return jsonify({"ok": True, "text": txt})
+    except Exception as e:
+        return jsonify({"ok": False, "text": f"[tail error] {e}"}), 500
 
 @app.get("/api/logs/live")
 def api_logs_live():
-    unit = request.args.get("unit", SERVICE)
-    lines = int(request.args.get("lines", "80"))
+    unit = request.args.get("unit", SERVICE_FAILOVER)
+    initial_lines = int(request.args.get("lines", "80"))
 
-    def generate():
-        # Tail first:
+    def stream():
+        # initial tail
         try:
-            tail = run(["journalctl", "-u", unit, "-n", str(lines), "--no-pager", "-o", "cat"], timeout=10).stdout or ""
+            tail = run(["journalctl", "-u", unit, "-n", str(initial_lines), "--no-pager", "-o", "cat"], timeout=10).stdout or ""
             for ln in tail.splitlines():
-                yield sse_format(ln)
+                yield sse(ln)
         except Exception as e:
-            yield sse_format(f"[tail error] {e}")
+            yield sse(f"[tail error] {e}")
 
-        # Follow:
+        # follow
         cmd = ["journalctl", "-u", unit, "-f", "-o", "cat", "--no-pager"]
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
@@ -185,186 +204,188 @@ def api_logs_live():
                 if not line:
                     time.sleep(0.1)
                     continue
-                yield sse_format(line.rstrip("\n"))
+                yield sse(line.rstrip("\n"))
         except GeneratorExit:
-            # client disconnected
             return
         except Exception as e:
-            yield sse_format(f"[follow error] {e}")
+            yield sse(f"[follow error] {e}")
 
-    return Response(generate(), mimetype="text/event-stream")
+    return Response(stream(), mimetype="text/event-stream")
 
-# -----------------------
-# Metrics API
-# -----------------------
+# -----------------------------
+# Metrics
+# -----------------------------
 @app.get("/api/metrics")
 def api_metrics():
-    # Primary + port
-    primary_svc, primary_port = failover_current()
+    primary_svc, primary_port = get_current_primary()
 
-    # Load timeseries (bytes derivative)
-    bps_series = []
-    kpi_now = 0.0
-    kpi_1m = 0.0
-    kpi_5m = 0.0
+    # traffic series
+    series = []
+    now_bps = 0.0
+    avg_60 = 0.0
+    avg_300 = 0.0
 
-    if primary_port and primary_port != "-":
-        pts = read_traffic_points(primary_port, max_points=METRICS_POINTS)
+    if primary_port not in ("", "-"):
+        path = traffic_log_path(primary_port)
+        lines = read_last_lines(path, max_lines=MAX_SERIES_POINTS + 10)
+        pts = parse_points(lines)
         bps_pts = points_to_bps(pts)
-        # Provide last N points (ts, bps)
-        bps_series = [{"t": ts, "bps": bps} for ts, bps in bps_pts[-METRICS_POINTS:]]
 
-        # KPIs
+        # cap
+        bps_pts = bps_pts[-MAX_SERIES_POINTS:]
+        series = [{"t": t, "bps": v} for (t, v) in bps_pts]
+
         if bps_pts:
-            kpi_now = bps_pts[-1][1]
-
-            # avg last 1m (approx last 60s)
             now_ts = bps_pts[-1][0]
-            last_60 = [v for (t, v) in bps_pts if t >= now_ts - 60]
-            if last_60:
-                kpi_1m = sum(last_60) / len(last_60)
+            now_bps = bps_pts[-1][1]
+            last60 = [v for (t, v) in bps_pts if t >= now_ts - 60]
+            last300 = [v for (t, v) in bps_pts if t >= now_ts - 300]
+            avg_60 = avg(last60)
+            avg_300 = avg(last300)
 
-            # avg last 5m
-            last_300 = [v for (t, v) in bps_pts if t >= now_ts - 300]
-            if last_300:
-                kpi_5m = sum(last_300) / len(last_300)
-
-    # system states
     data = {
         "primary": {"service": primary_svc, "port": primary_port},
         "units": {
-            "failover_service": "active" if is_active(SERVICE) else "inactive",
-            "timer": "active" if is_active(TIMER) else "inactive",
-            "web": "active" if is_active(WEB_SERVICE) else "inactive",
+            "failover": "active" if is_active(SERVICE_FAILOVER) else "inactive",
+            "timer": "active" if is_active(TIMER_FAILOVER) else "inactive",
+            "web": "active" if is_active(SERVICE_WEB) else "inactive",
         },
         "traffic": {
-            "series": bps_series,
-            "now": {"bps": kpi_now, "human": human_bps(kpi_now)},
-            "avg1m": {"bps": kpi_1m, "human": human_bps(kpi_1m)},
-            "avg5m": {"bps": kpi_5m, "human": human_bps(kpi_5m)},
-        },
-        "poll_sec": METRICS_POLL_SEC,
+            "series": series,
+            "now": {"bps": now_bps, "human": human_bps(now_bps)},
+            "avg1m": {"bps": avg_60, "human": human_bps(avg_60)},
+            "avg5m": {"bps": avg_300, "human": human_bps(avg_300)},
+        }
     }
     return jsonify(data)
 
-# -----------------------
-# Actions API
-# -----------------------
+@app.get("/api/tunnels")
+def api_tunnels():
+    rows = get_tunnels()
+    return jsonify({"ok": True, "rows": rows})
+
+# -----------------------------
+# Actions
+# -----------------------------
 @app.post("/api/action")
 def api_action():
     payload = request.get_json(silent=True) or {}
     action = (payload.get("action") or "").strip()
     svc = (payload.get("service") or "").strip()
 
-    allowed_actions = {
+    allowed = {
         "run_once",
         "timer_on", "timer_off",
         "web_restart",
         "switch",
         "tunnel_start", "tunnel_stop", "tunnel_restart",
     }
-    if action not in allowed_actions:
+    if action not in allowed:
         return jsonify({"ok": False, "error": "Invalid action"}), 400
 
     try:
         if action == "run_once":
-            out = run(["systemctl", "start", SERVICE], timeout=15).stdout
-            return jsonify({"ok": True, "output": out or "Ran once"})
+            out = run(["systemctl", "start", SERVICE_FAILOVER], timeout=20).stdout or ""
+            return jsonify({"ok": True, "output": out or "Failover check executed."})
 
         if action == "timer_on":
-            out = run(["systemctl", "enable", "--now", TIMER], timeout=15).stdout
-            return jsonify({"ok": True, "output": out or "Timer enabled"})
+            out = run(["systemctl", "enable", "--now", TIMER_FAILOVER], timeout=20).stdout or ""
+            return jsonify({"ok": True, "output": out or "Timer enabled."})
 
         if action == "timer_off":
-            out = run(["systemctl", "disable", "--now", TIMER], timeout=15).stdout
-            return jsonify({"ok": True, "output": out or "Timer disabled"})
+            out = run(["systemctl", "disable", "--now", TIMER_FAILOVER], timeout=20).stdout or ""
+            return jsonify({"ok": True, "output": out or "Timer disabled."})
 
         if action == "web_restart":
-            out = run(["systemctl", "restart", WEB_SERVICE], timeout=15).stdout
-            return jsonify({"ok": True, "output": out or "Web restarted"})
+            out = run(["systemctl", "restart", SERVICE_WEB], timeout=20).stdout or ""
+            return jsonify({"ok": True, "output": out or "Web service restarted."})
 
-        # Tunnel actions require service name
+        # tunnel actions require svc
         if action in {"switch", "tunnel_start", "tunnel_stop", "tunnel_restart"} and not svc:
-            return jsonify({"ok": False, "error": "Missing service"}), 400
+            return jsonify({"ok": False, "error": "Missing service name"}), 400
 
         if action == "switch":
-            out = run([FAILOVER_BIN, "--switch", svc], timeout=60).stdout
-            return jsonify({"ok": True, "output": out[-6000:] if out else "OK"})
+            out = run([FAILOVER_BIN, "--switch", svc], timeout=70).stdout or ""
+            return jsonify({"ok": True, "output": out[-8000:] if out else "Switch command completed."})
 
         if action == "tunnel_start":
-            out = run([FAILOVER_BIN, "--start", svc], timeout=20).stdout
+            out = run([FAILOVER_BIN, "--start", svc], timeout=25).stdout or ""
             return jsonify({"ok": True, "output": out[-4000:] if out else f"Started {svc}"})
 
         if action == "tunnel_stop":
-            out = run([FAILOVER_BIN, "--stop", svc], timeout=20).stdout
+            out = run([FAILOVER_BIN, "--stop", svc], timeout=25).stdout or ""
             return jsonify({"ok": True, "output": out[-4000:] if out else f"Stopped {svc}"})
 
         if action == "tunnel_restart":
-            out = run([FAILOVER_BIN, "--restart", svc], timeout=30).stdout
-            return jsonify({"ok": True, "output": out[-4000:] if out else f"Restarted {svc}"})
+            out = run([FAILOVER_BIN, "--restart", svc], timeout=35).stdout or ""
+            return jsonify({"ok": True, "output": out[-6000:] if out else f"Restarted {svc}"})
 
-        return jsonify({"ok": False, "error": "Unhandled"}), 500
+        return jsonify({"ok": False, "error": "Unhandled action"}), 500
 
     except subprocess.TimeoutExpired:
-        return jsonify({"ok": False, "error": "Command timeout"}), 504
+        return jsonify({"ok": False, "error": "Command timed out"}), 504
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-# -----------------------
-# UI
-# -----------------------
-TPL = r"""
+# -----------------------------
+# UI (English, dark, responsive)
+# -----------------------------
+HTML = r"""
 <!doctype html>
-<html lang="fa" dir="rtl">
+<html lang="en" dir="ltr">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Backhaul Command Center</title>
 
-  <!-- Bootstrap -->
-  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.rtl.min.css" rel="stylesheet">
-  <!-- Icons -->
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
   <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
-  <!-- Chart.js -->
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 
   <style>
     :root{
-      --bg0:#070B14;
-      --bg1:#0B1220;
-      --card:#0F1930;
-      --card2:#0C162B;
-      --line:#223055;
-      --txt:#E8EEFF;
-      --muted:#9FB0D8;
+      --bg0:#060812;
+      --bg1:#0b1220;
+      --card:#0f1a33;
+      --card2:#0b162d;
+      --line:rgba(90,120,200,.22);
+      --text:#eaf0ff;
+      --muted:#9fb0d8;
       --good:#22c55e;
       --warn:#f59e0b;
       --bad:#ef4444;
       --accent:#7c3aed;
       --accent2:#06b6d4;
-      --shadow: 0 10px 30px rgba(0,0,0,.35);
-      --radius:18px;
+      --shadow: 0 14px 40px rgba(0,0,0,.35);
+      --r:18px;
     }
+
     body{
-      background: radial-gradient(1200px 700px at 20% 10%, rgba(124,58,237,.25), transparent 55%),
-                  radial-gradient(900px 600px at 80% 30%, rgba(6,182,212,.18), transparent 60%),
-                  linear-gradient(180deg, var(--bg0), var(--bg1));
-      color: var(--txt);
-      min-height: 100vh;
+      background:
+        radial-gradient(900px 600px at 15% 10%, rgba(124,58,237,.22), transparent 60%),
+        radial-gradient(900px 600px at 85% 30%, rgba(6,182,212,.16), transparent 62%),
+        linear-gradient(180deg, var(--bg0), var(--bg1));
+      color: var(--text);
+      min-height:100vh;
     }
+
     .topbar{
       position: sticky; top: 0; z-index: 50;
       backdrop-filter: blur(10px);
-      background: rgba(7,11,20,.45);
-      border-bottom: 1px solid rgba(34,48,85,.6);
+      background: rgba(6,8,18,.55);
+      border-bottom: 1px solid var(--line);
     }
+
     .brand{
+      font-weight: 900;
       letter-spacing: .3px;
-      font-weight: 800;
+      font-size: 1.05rem;
     }
+    .subbrand{ color: var(--muted); font-size: .85rem; }
+
     .chip{
-      border: 1px solid rgba(34,48,85,.8);
-      background: rgba(15,25,48,.7);
+      border: 1px solid var(--line);
+      background: rgba(15,26,51,.55);
       border-radius: 999px;
       padding: .35rem .7rem;
       display: inline-flex;
@@ -375,67 +396,51 @@ TPL = r"""
     }
     .dot{ width:10px; height:10px; border-radius:50%; display:inline-block; }
     .dot.good{ background: var(--good); box-shadow: 0 0 0 4px rgba(34,197,94,.12); }
-    .dot.warn{ background: var(--warn); box-shadow: 0 0 0 4px rgba(245,158,11,.12); }
     .dot.bad{  background: var(--bad);  box-shadow: 0 0 0 4px rgba(239,68,68,.12); }
 
     .panel{
-      background: linear-gradient(180deg, rgba(15,25,48,.95), rgba(12,22,43,.95));
-      border: 1px solid rgba(34,48,85,.75);
-      border-radius: var(--radius);
+      background: linear-gradient(180deg, rgba(15,26,51,.92), rgba(11,22,45,.92));
+      border: 1px solid var(--line);
+      border-radius: var(--r);
       box-shadow: var(--shadow);
+      overflow: hidden;
     }
-    .panel .panel-h{
+    .panel-h{
       padding: 14px 16px;
-      border-bottom: 1px solid rgba(34,48,85,.6);
-      display:flex; align-items:center; justify-content:space-between; gap:10px;
+      border-bottom: 1px solid var(--line);
+      display:flex; justify-content:space-between; align-items:center; gap:10px;
     }
-    .panel .panel-b{ padding: 14px 16px; }
+    .panel-b{ padding: 14px 16px; }
 
     .btn-soft{
       border-radius: 14px;
-      border: 1px solid rgba(34,48,85,.8);
-      background: rgba(17,26,46,.55);
-      color: var(--txt);
+      border: 1px solid var(--line);
+      background: rgba(15,26,51,.45);
+      color: var(--text);
     }
-    .btn-soft:hover{ border-color: rgba(124,58,237,.9); }
+    .btn-soft:hover{ border-color: rgba(124,58,237,.85); }
     .btn-accent{
       border-radius: 14px;
-      border: 1px solid rgba(124,58,237,.8);
+      border: 1px solid rgba(124,58,237,.75);
       background: rgba(124,58,237,.18);
-      color: var(--txt);
+      color: var(--text);
     }
-    .btn-accent:hover{ background: rgba(124,58,237,.28); }
     .btn-danger-soft{
       border-radius: 14px;
-      border: 1px solid rgba(239,68,68,.6);
+      border: 1px solid rgba(239,68,68,.55);
       background: rgba(239,68,68,.12);
-      color: var(--txt);
+      color: var(--text);
     }
 
     .kpi{
-      border: 1px solid rgba(34,48,85,.75);
-      background: rgba(11,18,32,.55);
+      border: 1px solid var(--line);
+      background: rgba(8,12,24,.35);
       border-radius: 16px;
       padding: 12px;
     }
     .kpi .label{ color: var(--muted); font-size: .85rem; }
-    .kpi .value{ font-size: 1.25rem; font-weight: 800; letter-spacing:.2px; }
-    .kpi .sub{ color: var(--muted); font-size: .8rem; margin-top:2px; }
-
-    .table-dark{
-      --bs-table-bg: transparent;
-      --bs-table-color: var(--txt);
-      --bs-table-border-color: rgba(34,48,85,.6);
-    }
-    .table thead th{
-      color: var(--muted);
-      font-weight: 700;
-      border-bottom: 1px solid rgba(34,48,85,.8) !important;
-    }
-    .table tbody td{
-      border-top: 1px solid rgba(34,48,85,.45) !important;
-      vertical-align: middle;
-    }
+    .kpi .value{ font-size: 1.2rem; font-weight: 900; letter-spacing:.2px; }
+    .kpi .sub{ color: var(--muted); font-size: .8rem; }
 
     .logbox{
       height: 360px;
@@ -443,39 +448,65 @@ TPL = r"""
       font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
       font-size: 12.5px;
       line-height: 1.45;
-      background: rgba(7,11,20,.65);
-      border: 1px solid rgba(34,48,85,.75);
+      background: rgba(6,8,18,.6);
+      border: 1px solid var(--line);
       border-radius: 16px;
       padding: 12px;
       white-space: pre-wrap;
     }
-    .logbox .muted{ color: rgba(159,176,216,.85); }
 
-    .nav-pills .nav-link{
-      color: var(--muted);
-      border-radius: 14px;
-      border: 1px solid rgba(34,48,85,.55);
-      background: rgba(15,25,48,.35);
+    .table-dark{
+      --bs-table-bg: transparent;
+      --bs-table-color: var(--text);
+      --bs-table-border-color: var(--line);
     }
-    .nav-pills .nav-link.active{
-      color: var(--txt);
-      border-color: rgba(124,58,237,.95);
-      background: rgba(124,58,237,.2);
+    .table thead th{
+      color: var(--muted);
+      font-weight: 800;
+      border-bottom: 1px solid var(--line) !important;
+    }
+    .table tbody td{
+      border-top: 1px solid rgba(90,120,200,.18) !important;
+      vertical-align: middle;
+    }
+
+    /* CRITICAL: fixed chart box to prevent runaway resizing */
+    .chartWrap{
+      position: relative;
+      width: 100%;
+      height: 320px;
+      overflow: hidden;
+      border-radius: 16px;
+      border: 1px solid var(--line);
+      background: rgba(6,8,18,.35);
+    }
+    @media (max-width: 576px){
+      .chartWrap{ height: 240px; }
+      .logbox{ height: 300px; }
+      .kpi .value{ font-size: 1.05rem; }
     }
 
     .toast-container{ z-index: 9999; }
     .toast{
-      background: rgba(15,25,48,.95);
-      border: 1px solid rgba(34,48,85,.85);
-      color: var(--txt);
+      background: rgba(15,26,51,.96);
+      border: 1px solid var(--line);
+      color: var(--text);
       border-radius: 16px;
       box-shadow: var(--shadow);
     }
 
-    @media (max-width: 576px){
-      .logbox{ height: 300px; }
-      .kpi .value{ font-size: 1.05rem; }
+    .nav-pills .nav-link{
+      color: var(--muted);
+      border-radius: 14px;
+      border: 1px solid rgba(90,120,200,.18);
+      background: rgba(15,26,51,.35);
     }
+    .nav-pills .nav-link.active{
+      color: var(--text);
+      border-color: rgba(124,58,237,.9);
+      background: rgba(124,58,237,.2);
+    }
+    .tiny{ color: var(--muted); font-size: .85rem; }
   </style>
 </head>
 
@@ -483,40 +514,39 @@ TPL = r"""
   <div class="topbar py-3">
     <div class="container d-flex flex-wrap align-items-center justify-content-between gap-2">
       <div class="d-flex align-items-center gap-2">
-        <i class="bi bi-cpu-fill" style="font-size:1.3rem;color:rgba(124,58,237,.95)"></i>
+        <i class="bi bi-cpu-fill" style="font-size:1.35rem;color:rgba(124,58,237,.95)"></i>
         <div>
           <div class="brand">Backhaul Command Center</div>
-          <div class="small" style="color:var(--muted)">failover • tunnels • logs • traffic</div>
+          <div class="subbrand">failover • tunnels • logs • traffic</div>
         </div>
       </div>
-
       <div class="d-flex flex-wrap gap-2">
-        <span class="chip"><span id="dot-service" class="dot warn"></span> Failover <span id="st-service">…</span></span>
-        <span class="chip"><span id="dot-timer" class="dot warn"></span> Timer <span id="st-timer">…</span></span>
-        <span class="chip"><span id="dot-web" class="dot warn"></span> Web <span id="st-web">…</span></span>
+        <span class="chip"><span id="dot-failover" class="dot bad"></span> Failover: <span id="st-failover">…</span></span>
+        <span class="chip"><span id="dot-timer" class="dot bad"></span> Timer: <span id="st-timer">…</span></span>
+        <span class="chip"><span id="dot-web" class="dot bad"></span> Web: <span id="st-web">…</span></span>
       </div>
     </div>
   </div>
 
   <div class="container py-4">
     <div class="d-flex flex-wrap gap-2 justify-content-between align-items-center mb-3">
-      <ul class="nav nav-pills gap-2" id="tabs">
-        <li class="nav-item"><button class="nav-link active" data-bs-toggle="pill" data-bs-target="#tab-dash" type="button">داشبورد</button></li>
-        <li class="nav-item"><button class="nav-link" data-bs-toggle="pill" data-bs-target="#tab-tunnels" type="button">تانل‌ها</button></li>
-        <li class="nav-item"><button class="nav-link" data-bs-toggle="pill" data-bs-target="#tab-logs" type="button">لاگ‌ها</button></li>
+      <ul class="nav nav-pills gap-2">
+        <li class="nav-item"><button class="nav-link active" data-bs-toggle="pill" data-bs-target="#tab-dashboard" type="button">Dashboard</button></li>
+        <li class="nav-item"><button class="nav-link" data-bs-toggle="pill" data-bs-target="#tab-tunnels" type="button">Tunnels</button></li>
+        <li class="nav-item"><button class="nav-link" data-bs-toggle="pill" data-bs-target="#tab-logs" type="button">Logs</button></li>
       </ul>
 
-      <div class="d-flex gap-2">
-        <button class="btn btn-soft btn-sm" onclick="act('run_once')"><i class="bi bi-play-fill"></i> اجرای یک‌بار</button>
-        <button class="btn btn-accent btn-sm" onclick="act('timer_on')"><i class="bi bi-lightning-charge-fill"></i> Timer On</button>
-        <button class="btn btn-soft btn-sm" onclick="act('timer_off')"><i class="bi bi-pause-fill"></i> Timer Off</button>
-        <button class="btn btn-soft btn-sm" onclick="act('web_restart')"><i class="bi bi-arrow-repeat"></i> Restart Web</button>
+      <div class="d-flex flex-wrap gap-2">
+        <button class="btn btn-soft btn-sm" onclick="action('run_once')"><i class="bi bi-play-fill"></i> Run check</button>
+        <button class="btn btn-accent btn-sm" onclick="action('timer_on')"><i class="bi bi-lightning-charge-fill"></i> Timer on</button>
+        <button class="btn btn-soft btn-sm" onclick="action('timer_off')"><i class="bi bi-pause-fill"></i> Timer off</button>
+        <button class="btn btn-soft btn-sm" onclick="action('web_restart')"><i class="bi bi-arrow-repeat"></i> Restart web</button>
       </div>
     </div>
 
     <div class="tab-content">
-      <!-- DASH -->
-      <div class="tab-pane fade show active" id="tab-dash">
+      <!-- Dashboard -->
+      <div class="tab-pane fade show active" id="tab-dashboard">
         <div class="row g-3">
           <div class="col-12 col-lg-5">
             <div class="panel">
@@ -525,7 +555,7 @@ TPL = r"""
                   <i class="bi bi-hdd-network-fill" style="color:rgba(6,182,212,.95)"></i>
                   <div class="fw-bold">Primary</div>
                 </div>
-                <div class="small" style="color:var(--muted)">شناسه اصلی و وضعیت</div>
+                <div class="tiny">current active tunnel</div>
               </div>
               <div class="panel-b">
                 <div class="kpi mb-2">
@@ -535,32 +565,27 @@ TPL = r"""
                 </div>
 
                 <div class="row g-2">
-                  <div class="col-4">
-                    <div class="kpi">
-                      <div class="label">Now</div>
-                      <div class="value" id="kpi-now">…</div>
-                      <div class="sub">لحظه‌ای</div>
-                    </div>
-                  </div>
-                  <div class="col-4">
-                    <div class="kpi">
-                      <div class="label">Avg 1m</div>
-                      <div class="value" id="kpi-1m">…</div>
-                      <div class="sub">میانگین ۱ دقیقه</div>
-                    </div>
-                  </div>
-                  <div class="col-4">
-                    <div class="kpi">
-                      <div class="label">Avg 5m</div>
-                      <div class="value" id="kpi-5m">…</div>
-                      <div class="sub">میانگین ۵ دقیقه</div>
-                    </div>
-                  </div>
+                  <div class="col-4"><div class="kpi">
+                    <div class="label">Now</div>
+                    <div class="value" id="kpi-now">…</div>
+                    <div class="sub">instant</div>
+                  </div></div>
+                  <div class="col-4"><div class="kpi">
+                    <div class="label">Avg 1m</div>
+                    <div class="value" id="kpi-1m">…</div>
+                    <div class="sub">rolling</div>
+                  </div></div>
+                  <div class="col-4"><div class="kpi">
+                    <div class="label">Avg 5m</div>
+                    <div class="value" id="kpi-5m">…</div>
+                    <div class="sub">rolling</div>
+                  </div></div>
                 </div>
 
-                <div class="mt-3 d-flex gap-2">
+                <div class="mt-3 d-flex flex-wrap gap-2">
                   <button class="btn btn-accent btn-sm" onclick="refreshAll()"><i class="bi bi-arrow-clockwise"></i> Refresh</button>
-                  <button class="btn btn-soft btn-sm" onclick="scrollChartToEnd()"><i class="bi bi-graph-up"></i> Focus Now</button>
+                  <button class="btn btn-soft btn-sm" onclick="loadTunnels()"><i class="bi bi-diagram-3-fill"></i> Reload tunnels</button>
+                  <button class="btn btn-soft btn-sm" onclick="loadTail()"><i class="bi bi-journal-text"></i> Refresh logs</button>
                 </div>
               </div>
             </div>
@@ -573,12 +598,14 @@ TPL = r"""
                   <i class="bi bi-activity" style="color:rgba(124,58,237,.95)"></i>
                   <div class="fw-bold">Live Traffic</div>
                 </div>
-                <div class="small" style="color:var(--muted)">نمودار زنده مصرف (B/s)</div>
+                <div class="tiny">stable chart • capped points</div>
               </div>
               <div class="panel-b">
-                <canvas id="chart" height="120"></canvas>
-                <div class="small mt-2" style="color:var(--muted)">
-                  نکته: نمودار بر اساس لاگ‌های /run/backhaul-traffic ساخته می‌شود.
+                <div class="chartWrap">
+                  <canvas id="chart"></canvas>
+                </div>
+                <div class="tiny mt-2">
+                  Source: {{TRAFFIC_DIR}}/port-&lt;PORT&gt;.log
                 </div>
               </div>
             </div>
@@ -591,17 +618,17 @@ TPL = r"""
                   <i class="bi bi-terminal-fill" style="color:rgba(245,158,11,.95)"></i>
                   <div class="fw-bold">Action Output</div>
                 </div>
-                <div class="small" style="color:var(--muted)">خروجی آخرین عملیات</div>
+                <div class="tiny">latest output is on top</div>
               </div>
               <div class="panel-b">
-                <div class="logbox" id="outbox"><span class="muted">Ready.</span></div>
+                <div class="logbox" id="outbox">Ready.</div>
               </div>
             </div>
           </div>
         </div>
       </div>
 
-      <!-- TUNNELS -->
+      <!-- Tunnels -->
       <div class="tab-pane fade" id="tab-tunnels">
         <div class="panel">
           <div class="panel-h">
@@ -613,29 +640,27 @@ TPL = r"""
           </div>
           <div class="panel-b">
             <div class="table-responsive">
-              <table class="table table-dark table-sm align-middle" id="tunnels-table">
+              <table class="table table-dark table-sm align-middle">
                 <thead>
                   <tr>
                     <th>Service</th>
-                    <th>Active</th>
+                    <th>State</th>
                     <th>Port</th>
-                    <th>Toml</th>
-                    <th style="width: 260px;">Actions</th>
+                    <th>Config (toml)</th>
+                    <th style="width: 280px;">Actions</th>
                   </tr>
                 </thead>
-                <tbody id="tunnels-body">
-                  <tr><td colspan="5" style="color:var(--muted)">Loading…</td></tr>
+                <tbody id="tunnelsBody">
+                  <tr><td colspan="5" class="tiny">Loading…</td></tr>
                 </tbody>
               </table>
             </div>
-            <div class="small" style="color:var(--muted)">
-              Tip: Switch فقط وقتی انجام می‌شود که candidate واقعاً healthy شود (طبق منطق اسکریپت).
-            </div>
+            <div class="tiny">Switch will only finalize if the target becomes healthy (your script logic).</div>
           </div>
         </div>
       </div>
 
-      <!-- LOGS -->
+      <!-- Logs -->
       <div class="tab-pane fade" id="tab-logs">
         <div class="row g-3">
           <div class="col-12 col-lg-6">
@@ -648,7 +673,7 @@ TPL = r"""
                 <button class="btn btn-soft btn-sm" onclick="loadTail()"><i class="bi bi-arrow-clockwise"></i> Refresh</button>
               </div>
               <div class="panel-b">
-                <div class="logbox" id="tailbox"><span class="muted">Loading…</span></div>
+                <div class="logbox" id="tailbox">Loading…</div>
               </div>
             </div>
           </div>
@@ -666,7 +691,7 @@ TPL = r"""
                 </div>
               </div>
               <div class="panel-b">
-                <div class="logbox" id="livebox"><span class="muted">Click Start to stream live logs.</span></div>
+                <div class="logbox" id="livebox">Click Start to stream live logs.</div>
               </div>
             </div>
           </div>
@@ -676,7 +701,7 @@ TPL = r"""
     </div>
   </div>
 
-  <!-- Toasts -->
+  <!-- Toast -->
   <div class="toast-container position-fixed bottom-0 start-0 p-3">
     <div id="toast" class="toast" role="alert" aria-live="assertive" aria-atomic="true">
       <div class="toast-body" id="toastBody">…</div>
@@ -686,116 +711,185 @@ TPL = r"""
   <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 
   <script>
-    const outbox = document.getElementById('outbox');
-    const tailbox = document.getElementById('tailbox');
-    const livebox = document.getElementById('livebox');
-
-    let liveSource = null;
+    // --------------------------
+    // Chart stability knobs
+    // --------------------------
+    const MAX_POINTS = 180;     // hard cap in browser (prevents crashes)
+    const POLL_MS = 2000;       // refresh interval (safe)
+    let lastChartKey = "";
+    let chart;
 
     function toast(msg){
-      document.getElementById('toastBody').textContent = msg;
-      const t = new bootstrap.Toast(document.getElementById('toast'), {delay: 2200});
+      document.getElementById("toastBody").textContent = msg;
+      const t = new bootstrap.Toast(document.getElementById("toast"), {delay: 2000});
       t.show();
     }
 
-    function appendOut(text){
-      if(!text) return;
-      outbox.textContent = (text + "\\n\\n" + outbox.textContent).slice(0, 12000);
+    function setDot(dotId, textId, state){
+      const dot = document.getElementById(dotId);
+      const txt = document.getElementById(textId);
+      txt.textContent = state;
+      dot.classList.remove("good","bad");
+      dot.classList.add(state === "active" ? "good" : "bad");
     }
 
-    async function act(action, service=null){
+    function humanBps(bps){
+      if (bps < 1024) return `${bps.toFixed(0)} B/s`;
+      const kb = bps/1024;
+      if (kb < 1024) return `${kb.toFixed(1)} KB/s`;
+      const mb = kb/1024;
+      if (mb < 1024) return `${mb.toFixed(2)} MB/s`;
+      const gb = mb/1024;
+      return `${gb.toFixed(2)} GB/s`;
+    }
+
+    function makeChart(){
+      const ctx = document.getElementById("chart");
+      chart = new Chart(ctx, {
+        type: "line",
+        data: { labels: [], datasets: [{
+          label: "Traffic (B/s)",
+          data: [],
+          borderWidth: 2,
+          tension: 0.25,
+          pointRadius: 0,
+        }]},
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,  // required for fixed chartWrap height
+          animation: false,            // prevents UI lag/crash
+          parsing: false,
+          normalized: true,
+          plugins: {
+            legend: { labels: { color: "#9fb0d8" } },
+            tooltip: {
+              callbacks: {
+                label: (ctx) => " " + humanBps(ctx.raw || 0)
+              }
+            }
+          },
+          scales: {
+            x: { ticks: { color: "#9fb0d8", maxTicksLimit: 8 }, grid: { color: "rgba(90,120,200,.15)" } },
+            y: { ticks: { color: "#9fb0d8", maxTicksLimit: 6 }, grid: { color: "rgba(90,120,200,.15)" } }
+          }
+        }
+      });
+    }
+
+    function pushOutput(text){
+      const out = document.getElementById("outbox");
+      const now = new Date().toLocaleString();
+      const block = `[${now}] ${text}\n\n`;
+      out.textContent = (block + out.textContent).slice(0, 14000);
+    }
+
+    async function action(actionName, service=null){
       try{
         toast("Executing…");
-        const res = await fetch('/api/action', {
-          method: 'POST',
-          headers: {'Content-Type':'application/json'},
-          body: JSON.stringify({action, service})
+        const res = await fetch("/api/action", {
+          method: "POST",
+          headers: {"Content-Type":"application/json"},
+          body: JSON.stringify({action: actionName, service})
         });
         const j = await res.json();
         if(!j.ok){
-          toast("Error: " + (j.error || "unknown"));
-          appendOut("[ERROR] " + (j.error || "unknown"));
+          toast("Error");
+          pushOutput("ERROR: " + (j.error || "unknown"));
           return;
         }
         toast("Done");
-        appendOut(j.output || "OK");
+        pushOutput(j.output || "OK");
         await refreshAll();
         await loadTunnels();
       }catch(e){
-        toast("Network/Server error");
-        appendOut("[EXCEPTION] " + e);
+        toast("Network error");
+        pushOutput("EXCEPTION: " + e);
       }
     }
 
-    // --------- Tunnels ----------
     async function loadTunnels(){
+      const body = document.getElementById("tunnelsBody");
+      body.innerHTML = `<tr><td colspan="5" class="tiny">Loading…</td></tr>`;
       try{
-        // Reuse server-render list by hitting /api/action? no. We'll call a tiny helper:
-        const res = await fetch('/api/tunnels');
+        const res = await fetch("/api/tunnels");
         const j = await res.json();
-        const body = document.getElementById('tunnels-body');
-        body.innerHTML = "";
-        if(!j.rows || j.rows.length === 0){
-          body.innerHTML = `<tr><td colspan="5" style="color:var(--muted)">No tunnels found.</td></tr>`;
+        if(!j.ok || !j.rows){
+          body.innerHTML = `<tr><td colspan="5" class="tiny">Failed to load tunnels.</td></tr>`;
           return;
         }
+        if(j.rows.length === 0){
+          body.innerHTML = `<tr><td colspan="5" class="tiny">No tunnels found.</td></tr>`;
+          return;
+        }
+        body.innerHTML = "";
         for(const r of j.rows){
-          const badge = r.active === 'yes'
-            ? `<span class="badge" style="background:rgba(34,197,94,.15);border:1px solid rgba(34,197,94,.45);color:var(--txt)">ACTIVE</span>`
-            : `<span class="badge" style="background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.35);color:var(--txt)">OFF</span>`;
+          const stateBadge = (r.active === "yes")
+            ? `<span class="badge" style="background:rgba(34,197,94,.15);border:1px solid rgba(34,197,94,.45)">ACTIVE</span>`
+            : `<span class="badge" style="background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.35)">OFF</span>`;
 
-          body.insertAdjacentHTML('beforeend', `
+          body.insertAdjacentHTML("beforeend", `
             <tr>
               <td style="white-space:nowrap">${escapeHtml(r.service)}</td>
-              <td>${badge}</td>
+              <td>${stateBadge}</td>
               <td>${escapeHtml(r.port)}</td>
-              <td style="max-width:260px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--muted)">${escapeHtml(r.toml)}</td>
+              <td style="max-width:320px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--muted)">
+                ${escapeHtml(r.toml)}
+              </td>
               <td class="d-flex flex-wrap gap-2">
-                <button class="btn btn-accent btn-sm" onclick="act('switch', '${escapeAttr(r.service)}')"><i class="bi bi-shuffle"></i> Switch</button>
-                <button class="btn btn-soft btn-sm" onclick="act('tunnel_start', '${escapeAttr(r.service)}')">Start</button>
-                <button class="btn btn-soft btn-sm" onclick="act('tunnel_restart', '${escapeAttr(r.service)}')">Restart</button>
-                <button class="btn btn-danger-soft btn-sm" onclick="act('tunnel_stop', '${escapeAttr(r.service)}')">Stop</button>
+                <button class="btn btn-accent btn-sm" onclick="action('switch','${escapeAttr(r.service)}')">
+                  <i class="bi bi-shuffle"></i> Switch
+                </button>
+                <button class="btn btn-soft btn-sm" onclick="action('tunnel_start','${escapeAttr(r.service)}')">Start</button>
+                <button class="btn btn-soft btn-sm" onclick="action('tunnel_restart','${escapeAttr(r.service)}')">Restart</button>
+                <button class="btn btn-danger-soft btn-sm" onclick="action('tunnel_stop','${escapeAttr(r.service)}')">Stop</button>
               </td>
             </tr>
           `);
         }
       }catch(e){
-        appendOut("[tunnels error] " + e);
+        body.innerHTML = `<tr><td colspan="5" class="tiny">Error: ${escapeHtml(String(e))}</td></tr>`;
       }
     }
 
-    function escapeHtml(s){ return (s||"").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;"); }
-    function escapeAttr(s){ return (s||"").replaceAll("'","\\'"); }
+    function escapeHtml(s){
+      return (s||"").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");
+    }
+    function escapeAttr(s){
+      return (s||"").replaceAll("'","\\'");
+    }
 
-    // --------- Logs ----------
     async function loadTail(){
+      const box = document.getElementById("tailbox");
+      box.textContent = "Loading…";
       try{
-        const res = await fetch('/api/logs/tail');
+        const res = await fetch("/api/logs/tail?lines=300");
         const j = await res.json();
-        tailbox.textContent = j.text || "";
-        tailbox.scrollTop = tailbox.scrollHeight;
+        box.textContent = j.text || "";
+        box.scrollTop = box.scrollHeight;
       }catch(e){
-        tailbox.textContent = "[tail error] " + e;
+        box.textContent = "Error: " + e;
       }
     }
 
+    // Live logs
+    let liveSource = null;
     function startLive(){
       stopLive();
-      livebox.textContent = "";
-      liveSource = new EventSource('/api/logs/live?unit={{SERVICE}}&lines=80');
+      const box = document.getElementById("livebox");
+      box.textContent = "";
+      liveSource = new EventSource("/api/logs/live?lines=80");
       liveSource.onmessage = (ev) => {
-        livebox.textContent += ev.data + "\\n";
-        if(livebox.textContent.length > 20000){
-          livebox.textContent = livebox.textContent.slice(-18000);
+        box.textContent += ev.data.replaceAll("\\n","\n") + "\n";
+        if(box.textContent.length > 24000){
+          box.textContent = box.textContent.slice(-20000);
         }
-        livebox.scrollTop = livebox.scrollHeight;
+        box.scrollTop = box.scrollHeight;
       };
       liveSource.onerror = () => {
-        livebox.textContent += "\\n[stream] disconnected\\n";
+        box.textContent += "\n[stream disconnected]\n";
       };
       toast("Live logs started");
     }
-
     function stopLive(){
       if(liveSource){
         liveSource.close();
@@ -804,117 +898,50 @@ TPL = r"""
       }
     }
 
-    // --------- Chart ----------
-    let chart = null;
-    let lastSeriesLen = 0;
-
-    function makeChart(){
-      const ctx = document.getElementById('chart');
-      chart = new Chart(ctx, {
-        type: 'line',
-        data: {
-          labels: [],
-          datasets: [{
-            label: 'Traffic (B/s)',
-            data: [],
-            borderWidth: 2,
-            tension: 0.25,
-            pointRadius: 0,
-          }]
-        },
-        options: {
-          responsive: true,
-          maintainAspectRatio: false,
-          plugins: {
-            legend: { labels: { color: '#9FB0D8' } },
-            tooltip: {
-              callbacks: {
-                label: (ctx) => {
-                  const v = ctx.raw || 0;
-                  return ' ' + humanBps(v);
-                }
-              }
-            }
-          },
-          scales: {
-            x: { ticks: { color: '#9FB0D8' }, grid: { color: 'rgba(34,48,85,.25)' } },
-            y: { ticks: { color: '#9FB0D8' }, grid: { color: 'rgba(34,48,85,.25)' } }
-          }
-        }
-      });
-    }
-
-    function humanBps(bps){
-      if(bps < 1024) return `${bps.toFixed(0)} B/s`;
-      const kb = bps/1024;
-      if(kb < 1024) return `${kb.toFixed(1)} KB/s`;
-      const mb = kb/1024;
-      if(mb < 1024) return `${mb.toFixed(2)} MB/s`;
-      const gb = mb/1024;
-      return `${gb.toFixed(2)} GB/s`;
-    }
-
-    function setStatusDot(idDot, idText, state){
-      const dot = document.getElementById(idDot);
-      const t = document.getElementById(idText);
-      t.textContent = state;
-      dot.classList.remove('good','warn','bad');
-      if(state === 'active'){ dot.classList.add('good'); }
-      else { dot.classList.add('bad'); }
-    }
-
     async function refreshAll(){
       try{
-        const res = await fetch('/api/metrics');
+        const res = await fetch("/api/metrics");
         const m = await res.json();
 
-        document.getElementById('primary-svc').textContent = m.primary.service || '-';
-        document.getElementById('primary-port').textContent = m.primary.port || '-';
+        document.getElementById("primary-svc").textContent = m.primary.service || "-";
+        document.getElementById("primary-port").textContent = m.primary.port || "-";
 
-        setStatusDot('dot-service','st-service', m.units.failover_service);
-        setStatusDot('dot-timer','st-timer', m.units.timer);
-        setStatusDot('dot-web','st-web', m.units.web);
+        setDot("dot-failover","st-failover", m.units.failover);
+        setDot("dot-timer","st-timer", m.units.timer);
+        setDot("dot-web","st-web", m.units.web);
 
-        document.getElementById('kpi-now').textContent = m.traffic.now.human;
-        document.getElementById('kpi-1m').textContent = m.traffic.avg1m.human;
-        document.getElementById('kpi-5m').textContent = m.traffic.avg5m.human;
+        document.getElementById("kpi-now").textContent = m.traffic.now.human;
+        document.getElementById("kpi-1m").textContent = m.traffic.avg1m.human;
+        document.getElementById("kpi-5m").textContent = m.traffic.avg5m.human;
 
-        // Update chart
-        const series = m.traffic.series || [];
+        // Update chart safely
+        const series = (m.traffic.series || []).slice(-MAX_POINTS);
         const labels = series.map(x => {
           const d = new Date(x.t * 1000);
-          return d.toLocaleTimeString('fa-IR', {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+          return d.toLocaleTimeString(undefined, {hour:"2-digit", minute:"2-digit", second:"2-digit"});
         });
         const data = series.map(x => x.bps);
 
-        if(chart){
+        // avoid redundant heavy updates
+        const key = String(labels.length) + ":" + (labels[labels.length-1] || "");
+        if(key !== lastChartKey){
+          lastChartKey = key;
           chart.data.labels = labels;
           chart.data.datasets[0].data = data;
-          chart.update('none');
+          chart.update("none");
         }
 
-        // auto refresh period
-        const poll = (m.poll_sec || 2.0) * 1000;
-        window.__poll = poll;
-
       }catch(e){
-        appendOut("[metrics error] " + e);
+        pushOutput("metrics error: " + e);
       }
     }
 
-    function scrollChartToEnd(){
-      // nothing needed; chart always shows latest. (placeholder)
-      toast("Focused on latest");
-    }
-
-    // --------- boot ----------
+    // boot
     makeChart();
     loadTunnels();
     loadTail();
     refreshAll();
-
-    // periodic refresh
-    setInterval(() => refreshAll(), 2000);
+    setInterval(refreshAll, POLL_MS);
   </script>
 </body>
 </html>
@@ -922,26 +949,7 @@ TPL = r"""
 
 @app.get("/")
 def index():
-    # Render the UI (single page)
-    return render_template_string(TPL, SERVICE=SERVICE)
-
-# Extra API endpoints used by UI
-@app.get("/api/tunnels")
-def api_tunnels():
-    rows, _raw = failover_list()
-    payload = {"rows": [{"service": r[0], "active": r[1], "port": r[2], "toml": r[3]} for r in rows]}
-    return jsonify(payload)
-
-@app.get("/api/logs/tail")
-def api_logs_tail():
-    unit = request.args.get("unit", SERVICE)
-    lines = int(request.args.get("lines", "250"))
-    try:
-        txt = run(["journalctl", "-u", unit, "-n", str(lines), "--no-pager", "-o", "cat"], timeout=10).stdout or ""
-        return jsonify({"ok": True, "text": txt})
-    except Exception as e:
-        return jsonify({"ok": False, "text": f"[tail error] {e}"}), 500
+    return render_template_string(HTML, TRAFFIC_DIR=TRAFFIC_DIR)
 
 if __name__ == "__main__":
-    # For systemd usage; production can be behind a reverse proxy.
-    app.run(host="0.0.0.0", port=PORT, threaded=True)
+    app.run(host=WEB_HOST, port=WEB_PORT, threaded=True)
