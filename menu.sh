@@ -3,7 +3,6 @@ set -euo pipefail
 
 SERVICE="backhaul-failover.service"
 TIMER="backhaul-failover.timer"
-
 FAILOVER_BIN="/usr/local/bin/backhaul-failover.sh"
 
 green(){ printf "\033[32m%s\033[0m\n" "$*"; }
@@ -143,3 +142,12 @@ while true; do
     8) enable_autostart; pause ;;
     9) disable_autostart; pause ;;
     10) uninstall_all ;;
+    11) list_tunnels; pause ;;
+    12) manual_switch; pause ;;
+    13) manage_start; pause ;;
+    14) manage_stop; pause ;;
+    15) manage_restart; pause ;;
+    0) exit 0 ;;
+    *) red "Invalid option"; pause ;;
+  esac
+done
