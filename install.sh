@@ -25,16 +25,22 @@ fetch() {
   curl -fsSL "$url" -o "$out"
 }
 
-need_root
+validate_bash() {
+  local f="$1"
+  bash -n "$f" >/dev/null
+}
 
+need_root
 mkdir -p "$BIN_DIR"
 
 fetch "${REPO_RAW_BASE}/backhaul-failover.sh" "${FAILOVER_BIN}.new"
 chmod 755 "${FAILOVER_BIN}.new"
+validate_bash "${FAILOVER_BIN}.new"
 mv -f "${FAILOVER_BIN}.new" "$FAILOVER_BIN"
 
 fetch "${REPO_RAW_BASE}/menu.sh" "${MENU_BIN}.new"
 chmod 755 "${MENU_BIN}.new"
+validate_bash "${MENU_BIN}.new"
 mv -f "${MENU_BIN}.new" "$MENU_BIN"
 
 fetch "${REPO_RAW_BASE}/systemd/backhaul-failover.service" "${SERVICE_UNIT}.new"
@@ -48,5 +54,3 @@ systemctl enable --now backhaul-failover.timer >/dev/null
 
 echo "[+] Installed."
 "$MENU_BIN" || true
-exit 0
-
