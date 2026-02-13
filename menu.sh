@@ -4,6 +4,8 @@ set -euo pipefail
 SERVICE="backhaul-failover.service"
 TIMER="backhaul-failover.timer"
 
+FAILOVER_BIN="/usr/local/bin/backhaul-failover.sh"
+
 green(){ printf "\033[32m%s\033[0m\n" "$*"; }
 red(){ printf "\033[31m%s\033[0m\n" "$*"; }
 yellow(){ printf "\033[33m%s\033[0m\n" "$*"; }
@@ -39,6 +41,55 @@ run_once() { systemctl start "$SERVICE" || true; green "▶️ Ran once: $SERVIC
 enable_autostart() { systemctl enable --now "$TIMER" >/dev/null; green "✅ Enabled + started: $TIMER"; }
 disable_autostart() { systemctl disable --now "$TIMER" >/dev/null || true; green "🛑 Disabled + stopped: $TIMER"; }
 
+list_tunnels() {
+  echo
+  cyan "== Tunnels =="
+  "$FAILOVER_BIN" --list || true
+}
+
+manual_switch() {
+  echo
+  cyan "== Manual switch =="
+  "$FAILOVER_BIN" --list || true
+  echo
+  read -r -p "Enter service name to switch to (e.g. backhaul-iran1.service): " svc
+  if [[ -z "${svc:-}" ]]; then red "No service entered."; return; fi
+  "$FAILOVER_BIN" --switch "$svc" || red "Switch failed."
+}
+
+manage_start() {
+  echo
+  cyan "== Start tunnel =="
+  "$FAILOVER_BIN" --list || true
+  echo
+  read -r -p "Service to START: " svc
+  [[ -n "${svc:-}" ]] || { red "No service entered."; return; }
+  "$FAILOVER_BIN" --start "$svc" || true
+  green "Started: $svc"
+}
+
+manage_stop() {
+  echo
+  cyan "== Stop tunnel =="
+  "$FAILOVER_BIN" --list || true
+  echo
+  read -r -p "Service to STOP: " svc
+  [[ -n "${svc:-}" ]] || { red "No service entered."; return; }
+  "$FAILOVER_BIN" --stop "$svc" || true
+  green "Stopped: $svc"
+}
+
+manage_restart() {
+  echo
+  cyan "== Restart tunnel =="
+  "$FAILOVER_BIN" --list || true
+  echo
+  read -r -p "Service to RESTART: " svc
+  [[ -n "${svc:-}" ]] || { red "No service entered."; return; }
+  "$FAILOVER_BIN" --restart "$svc" || true
+  green "Restarted: $svc"
+}
+
 uninstall_all() {
   yellow "This will remove service, timer, and binaries."
   read -r -p "Type YES to uninstall: " ans
@@ -72,6 +123,11 @@ while true; do
   echo "8) Enable autostart"
   echo "9) Disable autostart"
   echo "10) Uninstall"
+  echo "11) List tunnels"
+  echo "12) Manual switch (pick service)"
+  echo "13) Start a tunnel service"
+  echo "14) Stop a tunnel service"
+  echo "15) Restart a tunnel service"
   echo "0) Exit"
   echo
   read -r -p "Select: " choice
@@ -87,7 +143,3 @@ while true; do
     8) enable_autostart; pause ;;
     9) disable_autostart; pause ;;
     10) uninstall_all ;;
-    0) exit 0 ;;
-    *) red "Invalid option"; pause ;;
-  esac
-done
