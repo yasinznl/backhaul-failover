@@ -26,7 +26,12 @@ TRAFFIC_MIN_PREV_BPS=1024       # 1KB/s
 
 LOCKFILE="/run/backhaul-failover.lock"
 exec 9>"$LOCKFILE"
-flock -n 9 || exit 0
+if ! flock -n 9; then
+  echo "[$(date '+%F %T')] 🟡 Lock busy; skipping this run."
+  exit 0
+fi
+echo "[$(date '+%F %T')] ℹ️  Lock acquired."
+
 
 USE_COLOR=1
 if [[ ! -t 1 ]]; then USE_COLOR=0; fi
@@ -85,8 +90,11 @@ is_listening() {
 
 has_fatal_errors_recently() {
   local svc="$1"
-  journalctl -u "$svc" --since "$FATAL_WINDOW" --no-pager 2>/dev/null | grep -Eiq "$FATAL_REGEX"
+  (journalctl -u "$svc" --since "$FATAL_WINDOW" --no-pager 2>/dev/null || true) \
+    | grep -Eiq "$FATAL_REGEX" && return 0
+  return 1
 }
+
 
 # Real-time health: must have ESTABLISHED TCP session to bind port
 has_established_now() {
