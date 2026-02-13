@@ -1,7 +1,4 @@
-# =========================================
-# FILE: backhaul-failover.sh
-# PATH: /usr/local/bin/backhaul-failover.sh
-# =========================================
+
 #!/usr/bin/env bash
 set -euo pipefail
 
