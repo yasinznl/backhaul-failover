@@ -1,44 +1,44 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# -----------------------------
+# Quiet mode: prevent log pollution for parsable outputs
+# -----------------------------
+QUIET=0
+if [[ "${1:-}" == "--current-raw" || "${1:-}" == "--current" || "${1:-}" == "--list" || "${1:-}" == "--list-raw" ]]; then
+  QUIET=1
+fi
+
 SERVICE_GLOB="backhaul-iran*.service"
 
+# primary failover anti-flap (per primary)
 FAIL_THRESHOLD=3
 STATE_FILE="/run/backhaul-failover.state"
 
+# fatal log detection
 FATAL_WINDOW="10 minutes ago"
 FATAL_REGEX="(panic|fatal|segfault|address already in use|bind failed|cannot bind|permission denied)"
 
+# candidate probing
 CANDIDATE_WAIT_SEC=30
 CANDIDATE_POLL_SEC=3
 
-TRAFFIC_DROP_WINDOW_SEC=600
-TRAFFIC_DROP_THRESHOLD_PCT=90
+# ---- Traffic health (10-min drop detection) ----
+# Compare avg traffic in last 10m vs previous 10m. If drop >= 90% -> unhealthy.
+TRAFFIC_DROP_WINDOW_SEC=600     # 10 minutes
+TRAFFIC_DROP_THRESHOLD_PCT=90   # drop >= 90% => bad
 TRAFFIC_LOG_DIR="/run/backhaul-traffic"
-TRAFFIC_MIN_PREV_BPS=1024
+
+# Fallback (optional): if prev window too small, ignore drop check
+TRAFFIC_MIN_PREV_BPS=1024       # 1KB/s
 
 LOCKFILE="/run/backhaul-failover.lock"
-
-# ---- switch log ----
-SWITCH_LOG="/var/log/backhaul-switch.log"
-SWITCH_LOG_MAX_LINES=5000
-
-switch_log() {
-  local from_svc="$1" from_port="$2" to_svc="$3" to_port="$4" reason="$5"
-  local ts
-  ts="$(date '+%F %T')"
-  mkdir -p "$(dirname "$SWITCH_LOG")" 2>/dev/null || true
-  echo "[$ts] SWITCH from=${from_svc:-none}(:${from_port:-?}) to=${to_svc:-none}(:${to_port:-?}) reason=${reason}" >> "$SWITCH_LOG" 2>/dev/null || true
-  # trim
-  tail -n "$SWITCH_LOG_MAX_LINES" "$SWITCH_LOG" > "${SWITCH_LOG}.tmp" 2>/dev/null && mv -f "${SWITCH_LOG}.tmp" "$SWITCH_LOG" 2>/dev/null || true
-}
-
 exec 9>"$LOCKFILE"
 if ! flock -n 9; then
-  echo "[$(date '+%F %T')] 🟡 Lock busy; skipping this run."
+  [[ "$QUIET" == "1" ]] || echo "[$(date '+%F %T')] 🟡 Lock busy; skipping this run."
   exit 0
 fi
-echo "[$(date '+%F %T')] ℹ️  Lock acquired."
+[[ "$QUIET" == "1" ]] || echo "[$(date '+%F %T')] ℹ️  Lock acquired."
 
 USE_COLOR=1
 if [[ ! -t 1 ]]; then USE_COLOR=0; fi
@@ -108,6 +108,7 @@ has_established_now() {
   ss -nt state established 2>/dev/null | grep -Eq "[:.]${port}\b"
 }
 
+# ---- Traffic helpers (TCP only) ----
 get_port_bytes_sum_now() {
   local port="$1"
   ss -tinH "( sport = :$port )" 2>/dev/null \
@@ -244,11 +245,13 @@ wait_until_healthy() {
 stop_and_wait_inactive() {
   local svc="$1"
   systemctl stop "$svc" >/dev/null 2>&1 || true
+
   local i
   for i in {1..10}; do
     systemctl is-active --quiet "$svc" || return 0
     sleep 1
   done
+
   systemctl kill "$svc" >/dev/null 2>&1 || true
   systemctl stop "$svc" >/dev/null 2>&1 || true
   systemctl reset-failed "$svc" >/dev/null 2>&1 || true
@@ -273,6 +276,7 @@ cmd_list() {
     echo "No services match: $SERVICE_GLOB"
     exit 0
   fi
+
   printf "%-35s %-8s %-7s %s\n" "SERVICE" "ACTIVE" "PORT" "TOML"
   for s in "${svcs_all[@]}"; do
     local toml port act
@@ -287,9 +291,11 @@ cmd_current() {
   local primary ptoml pport
   primary="$(get_primary_from_actives || true)"
   [[ -n "${primary:-}" ]] || { echo ""; exit 1; }
+
   ptoml="$(get_toml_from_unit "$primary")"
   pport="$(get_bind_port_from_toml "$ptoml" || true)"
   [[ -n "${pport:-}" ]] || { echo ""; exit 1; }
+
   echo "$primary $pport"
 }
 
@@ -297,9 +303,12 @@ cmd_current_raw() {
   local primary ptoml pport
   primary="$(get_primary_from_actives || true)"
   [[ -n "${primary:-}" ]] || exit 1
+
   ptoml="$(get_toml_from_unit "$primary")"
   pport="$(get_bind_port_from_toml "$ptoml" || true)"
   [[ -n "${pport:-}" ]] || exit 1
+
+  # MUST be exactly one clean line, tab-separated
   printf "%s\t%s\n" "$primary" "$pport"
 }
 
@@ -308,7 +317,10 @@ cmd_watch_traffic() {
   local interval="${2:-1}"
   [[ -n "${port:-}" ]] || { echo "Usage: $0 --watch-traffic <port> [interval]"; exit 2; }
 
-  local prev_b prev_t cur_b cur_t dt db bps
+  # FIX: validate numeric
+  [[ "$port" =~ ^[0-9]+$ ]] || { echo "ERROR: invalid port: '$port'"; exit 2; }
+
+  local prev_b prev_t cur_b cur_t dt db bps kb mb
   prev_b="$(get_port_bytes_sum_now "$port" || echo 0)"
   prev_t="$(date +%s)"
 
@@ -319,12 +331,16 @@ cmd_watch_traffic() {
     cur_t="$(date +%s)"
     dt=$((cur_t - prev_t))
     db=$((cur_b - prev_b))
+
     if (( dt > 0 && db >= 0 )); then
       bps=$((db/dt))
-      printf ":%s  %10s B/s  ~ %0.2f Mbps\n" "$port" "$bps" "$(awk -v x="$bps" 'BEGIN{printf (x*8/1000000)}')"
+      kb=$((bps/1024))
+      mb=$((bps/1024/1024))
+      printf ":%s  %10s B/s  (%7s KB/s)  (%5s MB/s)\n" "$port" "$bps" "$kb" "$mb"
     else
       printf ":%s  N/A\n" "$port"
     fi
+
     prev_b=$cur_b
     prev_t=$cur_t
   done
@@ -350,21 +366,14 @@ cmd_switch() {
   tport="$(get_bind_port_from_toml "$ttoml" || true)"
   [[ -n "${tport:-}" ]] || { echo "Cannot parse bind port for $target (toml=$ttoml)"; exit 1; }
 
-  local current cport
+  local current
   current="$(get_primary_from_actives || true)"
-  cport=""
-  if [[ -n "${current:-}" ]]; then
-    cport="$(get_bind_port_from_toml "$(get_toml_from_unit "$current")" 2>/dev/null || true)"
-  fi
 
   echo "[*] Manual switch to: $target (:$tport)"
   systemctl start "$target" >/dev/null 2>&1 || true
 
   if wait_until_healthy "$target" "$tport"; then
     echo "[+] Target is healthy. Enforcing single-active policy."
-    # log switch (manual)
-    switch_log "$current" "$cport" "$target" "$tport" "manual"
-
     if [[ -n "${current:-}" && "$current" != "$target" ]]; then
       stop_and_wait_inactive "$current"
     fi
@@ -416,6 +425,7 @@ main() {
   if is_healthy "$primary" "$pport"; then
     log_ok "Primary healthy: $primary (:$pport)"
     state_reset
+
     for b in "${backups[@]}"; do
       if is_active "$b"; then
         log_warn "Stopping backup (policy): $b"
@@ -441,7 +451,7 @@ main() {
     exit 0
   fi
 
-  local chosen="" chosen_port=""
+  local chosen=""
   for b in "${backups[@]}"; do
     local btoml bport
     btoml="$(get_toml_from_unit "$b")"
@@ -456,7 +466,6 @@ main() {
 
     if wait_until_healthy "$b" "$bport"; then
       chosen="$b"
-      chosen_port="$bport"
       log_ok "Candidate healthy: $b (:$bport)"
       break
     fi
@@ -469,9 +478,6 @@ main() {
     log_bad "No healthy backup found. Keeping primary running."
     exit 0
   fi
-
-  # log switch (auto) BEFORE stopping primary
-  switch_log "$primary" "$pport" "$chosen" "$chosen_port" "auto_unhealthy_primary"
 
   log_switch "Switching: stopping primary: $primary"
   stop_and_wait_inactive "$primary"
