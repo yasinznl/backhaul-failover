@@ -1,11 +1,10 @@
 [Unit]
-Description=Run backhaul failover monitor every ~75 seconds
+Description=Run backhaul failover monitor every 75 seconds (avoid overlap)
 
 [Timer]
 OnBootSec=30s
 OnUnitActiveSec=75s
 AccuracySec=5s
-RandomizedDelaySec=5s
 Unit=backhaul-failover.service
 
 [Install]
