@@ -6,8 +6,6 @@ TIMER="backhaul-failover.timer"
 FAILOVER_BIN="/usr/local/bin/backhaul-failover.sh"
 WEB_SERVICE="backhaul-failover-web.service"
 
-SWITCH_LOG="/var/log/backhaul-switch.log"
-
 have_tput=0
 command -v tput >/dev/null 2>&1 && have_tput=1
 
@@ -25,17 +23,26 @@ hr() {
   printf "%*s\n" "$w" "" | tr " " "─"
 }
 
-VERSION="2.2"
+VERSION="2.1"
 
 render_header() {
   clear
 
   local primary port timer_state web_state
-  primary="$("$FAILOVER_BIN" --current-raw 2>/dev/null | awk '{print $1}' || true)"
-  port="$("$FAILOVER_BIN" --current-raw 2>/dev/null | awk '{print $2}' || true)"
+  primary="$("$FAILOVER_BIN" --current-raw 2>/dev/null | awk -F'\t' 'NR==1{print $1}' || true)"
+  port="$("$FAILOVER_BIN" --current-raw 2>/dev/null | awk -F'\t' 'NR==1{print $2}' || true)"
 
-  if systemctl is-active --quiet "$TIMER"; then timer_state="${GREEN}ACTIVE${RESET}"; else timer_state="${RED}INACTIVE${RESET}"; fi
-  if systemctl is-active --quiet "$WEB_SERVICE"; then web_state="${GREEN}ACTIVE${RESET}"; else web_state="${RED}INACTIVE${RESET}"; fi
+  if systemctl is-active --quiet "$TIMER"; then
+    timer_state="${GREEN}ACTIVE${RESET}"
+  else
+    timer_state="${RED}INACTIVE${RESET}"
+  fi
+
+  if systemctl is-active --quiet "$WEB_SERVICE"; then
+    web_state="${GREEN}ACTIVE${RESET}"
+  else
+    web_state="${RED}INACTIVE${RESET}"
+  fi
 
   echo -e "${CYA}"
   echo "██████╗  █████╗  ██████╗██╗  ██╗██╗  ██╗ █████╗ ██╗   ██╗██╗     "
@@ -147,8 +154,13 @@ traffic_primary_live() {
   fi
 
   local svc port
-  svc="$(awk '{print $1}' <<<"$cur")"
-  port="$(awk '{print $2}' <<<"$cur")"
+  svc="$(printf "%s" "$cur" | awk -F'\t' 'NR==1{print $1}')"
+  port="$(printf "%s" "$cur" | awk -F'\t' 'NR==1{print $2}')"
+
+  if [[ -z "${port:-}" || ! "$port" =~ ^[0-9]+$ ]]; then
+    bad "Bad port from --current-raw: '$port' (raw='$cur')"
+    return
+  fi
 
   info "Primary: ${BOLD}${svc}${RESET}  Port: ${BOLD}:${port}${RESET}"
   echo
@@ -167,24 +179,14 @@ traffic_choose_live() {
   line="$("$FAILOVER_BIN" --list 2>/dev/null | awk -v s="$svc" '$1==s {print $0}' | head -n1 || true)"
   port="$(awk '{print $3}' <<<"$line" 2>/dev/null || true)"
 
-  if [[ -z "${port:-}" || "$port" == "-" ]]; then
-    bad "Could not determine port for: $svc"
+  if [[ -z "${port:-}" || "$port" == "-" || ! "$port" =~ ^[0-9]+$ ]]; then
+    bad "Could not determine numeric port for: $svc (got '$port')"
     return
   fi
 
   info "Service: ${BOLD}${svc}${RESET}  Port: ${BOLD}:${port}${RESET}"
   echo
   "$FAILOVER_BIN" --watch-traffic "$port" 1
-}
-
-switch_history() {
-  echo
-  echo "${BOLD}${CYA}== Switch history ==${RESET}"
-  if [[ ! -f "$SWITCH_LOG" ]]; then
-    warn "No switch log yet: $SWITCH_LOG"
-    return
-  fi
-  tail -n 200 "$SWITCH_LOG" || true
 }
 
 web_status() { systemctl status "$WEB_SERVICE" --no-pager -l || true; }
@@ -226,15 +228,12 @@ while true; do
   echo "  13) Live traffic (Primary)"
   echo "  14) Live traffic (Choose tunnel)"
   echo
-  echo "${BOLD}${WHT}Switch Log${RESET}"
-  echo "  15) Switch history"
-  echo
   echo "${BOLD}${WHT}Web Panel${RESET}"
-  echo "  16) Web status"
-  echo "  17) Web start"
-  echo "  18) Web stop"
-  echo "  19) Web restart"
-  echo "  20) Show web address"
+  echo "  15) Web status"
+  echo "  16) Web start"
+  echo "  17) Web stop"
+  echo "  18) Web restart"
+  echo "  19) Show web address"
   echo
   echo "  0) Exit"
   echo
@@ -255,12 +254,11 @@ while true; do
     12) manage_start_stop_restart; pause ;;
     13) traffic_primary_live ;;
     14) traffic_choose_live ;;
-    15) switch_history; pause ;;
-    16) web_status; pause ;;
-    17) web_start; pause ;;
-    18) web_stop; pause ;;
-    19) web_restart; pause ;;
-    20) web_show_addr; pause ;;
+    15) web_status; pause ;;
+    16) web_start; pause ;;
+    17) web_stop; pause ;;
+    18) web_restart; pause ;;
+    19) web_show_addr; pause ;;
     0) exit 0 ;;
     *) bad "Invalid option"; pause ;;
   esac
