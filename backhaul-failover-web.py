@@ -2,7 +2,7 @@
 import os
 import time
 import subprocess
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 from flask import Flask, request, Response, jsonify, render_template_string
 
 # -----------------------------
@@ -25,14 +25,17 @@ WEB_PORT = int(os.environ.get("BH_WEB_PORT", "8088"))
 TRAFFIC_DIR = os.environ.get("BH_TRAFFIC_DIR", "/run/backhaul-traffic")
 
 # How many points to return to chart (hard cap)
-MAX_SERIES_POINTS = int(os.environ.get("BH_MAX_SERIES_POINTS", "240"))  # keep small for stability
+MAX_SERIES_POINTS = int(os.environ.get("BH_MAX_SERIES_POINTS", "240"))
+
+# Switch log
+SWITCH_LOG = os.environ.get("BH_SWITCH_LOG", "/var/log/backhaul-failover-switch.log")
 
 # -----------------------------
 # Flask app
 # -----------------------------
 app = Flask(__name__)
 
-def run(cmd: List[str], timeout: int = 20) -> subprocess.CompletedProcess:
+def run(cmd: List[str], timeout: int = 25) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout)
 
 def is_active(unit: str) -> bool:
@@ -54,8 +57,11 @@ def guard():
 # Tunnels parsing
 # -----------------------------
 def get_current_primary() -> Tuple[str, str]:
-    p = run([FAILOVER_BIN, "--current"], timeout=10)
-    s = (p.stdout or "").strip()
+    try:
+        p = run([FAILOVER_BIN, "--current"], timeout=10)
+        s = (p.stdout or "").strip()
+    except Exception:
+        return "-", "-"
     if not s:
         return "-", "-"
     parts = s.split()
@@ -66,18 +72,20 @@ def get_current_primary() -> Tuple[str, str]:
 def get_tunnels() -> List[Dict[str, str]]:
     """
     Parses output of --list-raw (tab separated, no header)
+    service \t active \t port \t toml
     """
-    p = run([FAILOVER_BIN, "--list-raw"], timeout=15)
-    raw = p.stdout or ""
+    try:
+        p = run([FAILOVER_BIN, "--list-raw"], timeout=20)
+        raw = p.stdout or ""
+    except Exception:
+        raw = ""
 
     rows: List[Dict[str, str]] = []
-
     for line in raw.splitlines():
         line = line.strip()
         if not line:
             continue
-
-        parts = line.split("\t")   # مهم: tab جداست
+        parts = line.split("\t")
         if len(parts) >= 4:
             rows.append({
                 "service": parts[0],
@@ -85,9 +93,7 @@ def get_tunnels() -> List[Dict[str, str]]:
                 "port": parts[2],
                 "toml": parts[3],
             })
-
     return rows
-
 
 # -----------------------------
 # Traffic: read /run/backhaul-traffic/port-<PORT>.log
@@ -121,6 +127,8 @@ def parse_points(lines: List[str]) -> List[Tuple[int, int]]:
             pts.append((ts, b))
         except Exception:
             continue
+    # ensure sorted + unique-ish
+    pts.sort(key=lambda x: x[0])
     return pts
 
 def points_to_bps(points: List[Tuple[int, int]]) -> List[Tuple[int, float]]:
@@ -158,7 +166,6 @@ def avg(values: List[float]) -> float:
 # Logs: Tail + Live (SSE)
 # -----------------------------
 def sse(data: str) -> str:
-    # Keep it simple
     return "data: " + data.replace("\n", "\\n") + "\n\n"
 
 @app.get("/api/logs/tail")
@@ -166,7 +173,7 @@ def api_logs_tail():
     unit = request.args.get("unit", SERVICE_FAILOVER)
     lines = int(request.args.get("lines", "250"))
     try:
-        txt = run(["journalctl", "-u", unit, "-n", str(lines), "--no-pager", "-o", "cat"], timeout=12).stdout or ""
+        txt = run(["journalctl", "-u", unit, "-n", str(lines), "--no-pager", "-o", "cat"], timeout=15).stdout or ""
         return jsonify({"ok": True, "text": txt})
     except Exception as e:
         return jsonify({"ok": False, "text": f"[tail error] {e}"}), 500
@@ -177,15 +184,13 @@ def api_logs_live():
     initial_lines = int(request.args.get("lines", "80"))
 
     def stream():
-        # initial tail
         try:
-            tail = run(["journalctl", "-u", unit, "-n", str(initial_lines), "--no-pager", "-o", "cat"], timeout=10).stdout or ""
+            tail = run(["journalctl", "-u", unit, "-n", str(initial_lines), "--no-pager", "-o", "cat"], timeout=12).stdout or ""
             for ln in tail.splitlines():
                 yield sse(ln)
         except Exception as e:
             yield sse(f"[tail error] {e}")
 
-        # follow
         cmd = ["journalctl", "-u", unit, "-f", "-o", "cat", "--no-pager"]
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
@@ -205,13 +210,64 @@ def api_logs_live():
     return Response(stream(), mimetype="text/event-stream")
 
 # -----------------------------
+# Switch log: Tail + Live (SSE)
+# -----------------------------
+def read_switch_tail(lines: int = 200) -> str:
+    if not os.path.exists(SWITCH_LOG):
+        return ""
+    try:
+        with open(SWITCH_LOG, "r", encoding="utf-8", errors="ignore") as f:
+            data = f.readlines()[-lines:]
+        return "".join(data)
+    except Exception:
+        return ""
+
+@app.get("/api/switch/tail")
+def api_switch_tail():
+    lines = int(request.args.get("lines", "200"))
+    return jsonify({"ok": True, "text": read_switch_tail(lines)})
+
+@app.get("/api/switch/live")
+def api_switch_live():
+    initial_lines = int(request.args.get("lines", "50"))
+
+    def stream():
+        txt = read_switch_tail(initial_lines)
+        for ln in (txt or "").splitlines():
+            yield sse(ln)
+
+        last_size = 0
+        while True:
+            try:
+                if not os.path.exists(SWITCH_LOG):
+                    time.sleep(1.0)
+                    continue
+                size = os.path.getsize(SWITCH_LOG)
+                if size < last_size:
+                    last_size = 0  # rotated
+                if size > last_size:
+                    with open(SWITCH_LOG, "r", encoding="utf-8", errors="ignore") as f:
+                        f.seek(last_size)
+                        chunk = f.read()
+                    last_size = size
+                    for ln in chunk.splitlines():
+                        yield sse(ln)
+                time.sleep(1.0)
+            except GeneratorExit:
+                return
+            except Exception as e:
+                yield sse(f"[switch follow error] {e}")
+                time.sleep(2.0)
+
+    return Response(stream(), mimetype="text/event-stream")
+
+# -----------------------------
 # Metrics
 # -----------------------------
 @app.get("/api/metrics")
 def api_metrics():
     primary_svc, primary_port = get_current_primary()
 
-    # traffic series
     series = []
     now_bps = 0.0
     avg_60 = 0.0
@@ -219,11 +275,10 @@ def api_metrics():
 
     if primary_port not in ("", "-"):
         path = traffic_log_path(primary_port)
-        lines = read_last_lines(path, max_lines=MAX_SERIES_POINTS + 10)
+        lines = read_last_lines(path, max_lines=MAX_SERIES_POINTS + 20)
         pts = parse_points(lines)
         bps_pts = points_to_bps(pts)
 
-        # cap
         bps_pts = bps_pts[-MAX_SERIES_POINTS:]
         series = [{"t": t, "bps": v} for (t, v) in bps_pts]
 
@@ -277,39 +332,38 @@ def api_action():
 
     try:
         if action == "run_once":
-            out = run(["systemctl", "start", SERVICE_FAILOVER], timeout=20).stdout or ""
+            out = run(["systemctl", "start", SERVICE_FAILOVER], timeout=25).stdout or ""
             return jsonify({"ok": True, "output": out or "Failover check executed."})
 
         if action == "timer_on":
-            out = run(["systemctl", "enable", "--now", TIMER_FAILOVER], timeout=20).stdout or ""
+            out = run(["systemctl", "enable", "--now", TIMER_FAILOVER], timeout=25).stdout or ""
             return jsonify({"ok": True, "output": out or "Timer enabled."})
 
         if action == "timer_off":
-            out = run(["systemctl", "disable", "--now", TIMER_FAILOVER], timeout=20).stdout or ""
+            out = run(["systemctl", "disable", "--now", TIMER_FAILOVER], timeout=25).stdout or ""
             return jsonify({"ok": True, "output": out or "Timer disabled."})
 
         if action == "web_restart":
-            out = run(["systemctl", "restart", SERVICE_WEB], timeout=20).stdout or ""
+            out = run(["systemctl", "restart", SERVICE_WEB], timeout=25).stdout or ""
             return jsonify({"ok": True, "output": out or "Web service restarted."})
 
-        # tunnel actions require svc
         if action in {"switch", "tunnel_start", "tunnel_stop", "tunnel_restart"} and not svc:
             return jsonify({"ok": False, "error": "Missing service name"}), 400
 
         if action == "switch":
-            out = run([FAILOVER_BIN, "--switch", svc], timeout=70).stdout or ""
+            out = run([FAILOVER_BIN, "--switch", svc], timeout=90).stdout or ""
             return jsonify({"ok": True, "output": out[-8000:] if out else "Switch command completed."})
 
         if action == "tunnel_start":
-            out = run([FAILOVER_BIN, "--start", svc], timeout=25).stdout or ""
+            out = run([FAILOVER_BIN, "--start", svc], timeout=30).stdout or ""
             return jsonify({"ok": True, "output": out[-4000:] if out else f"Started {svc}"})
 
         if action == "tunnel_stop":
-            out = run([FAILOVER_BIN, "--stop", svc], timeout=25).stdout or ""
+            out = run([FAILOVER_BIN, "--stop", svc], timeout=30).stdout or ""
             return jsonify({"ok": True, "output": out[-4000:] if out else f"Stopped {svc}"})
 
         if action == "tunnel_restart":
-            out = run([FAILOVER_BIN, "--restart", svc], timeout=35).stdout or ""
+            out = run([FAILOVER_BIN, "--restart", svc], timeout=45).stdout or ""
             return jsonify({"ok": True, "output": out[-6000:] if out else f"Restarted {svc}"})
 
         return jsonify({"ok": False, "error": "Unhandled action"}), 500
@@ -368,11 +422,7 @@ HTML = r"""
       border-bottom: 1px solid var(--line);
     }
 
-    .brand{
-      font-weight: 900;
-      letter-spacing: .3px;
-      font-size: 1.05rem;
-    }
+    .brand{ font-weight: 900; letter-spacing: .3px; font-size: 1.05rem; }
     .subbrand{ color: var(--muted); font-size: .85rem; }
 
     .chip{
@@ -462,7 +512,6 @@ HTML = r"""
       vertical-align: middle;
     }
 
-    /* CRITICAL: fixed chart box to prevent runaway resizing */
     .chartWrap{
       position: relative;
       width: 100%;
@@ -575,9 +624,9 @@ HTML = r"""
                 </div>
 
                 <div class="mt-3 d-flex flex-wrap gap-2">
-                  <button class="btn btn-accent btn-sm" onclick="refreshAll()"><i class="bi bi-arrow-clockwise"></i> Refresh</button>
-                  <button class="btn btn-soft btn-sm" onclick="loadTunnels()"><i class="bi bi-diagram-3-fill"></i> Reload tunnels</button>
-                  <button class="btn btn-soft btn-sm" onclick="loadTail()"><i class="bi bi-journal-text"></i> Refresh logs</button>
+                  <button class="btn btn-accent btn-sm" onclick="refreshAll(true)"><i class="bi bi-arrow-clockwise"></i> Refresh</button>
+                  <button class="btn btn-soft btn-sm" onclick="loadTunnels(true)"><i class="bi bi-diagram-3-fill"></i> Reload tunnels</button>
+                  <button class="btn btn-soft btn-sm" onclick="loadTail(true)"><i class="bi bi-journal-text"></i> Refresh logs</button>
                 </div>
               </div>
             </div>
@@ -628,7 +677,7 @@ HTML = r"""
               <i class="bi bi-diagram-3-fill" style="color:rgba(6,182,212,.95)"></i>
               <div class="fw-bold">Tunnel Manager</div>
             </div>
-            <button class="btn btn-soft btn-sm" onclick="loadTunnels()"><i class="bi bi-arrow-clockwise"></i> Reload</button>
+            <button class="btn btn-soft btn-sm" onclick="loadTunnels(true)"><i class="bi bi-arrow-clockwise"></i> Reload</button>
           </div>
           <div class="panel-b">
             <div class="table-responsive">
@@ -662,7 +711,7 @@ HTML = r"""
                   <i class="bi bi-journal-text" style="color:rgba(245,158,11,.95)"></i>
                   <div class="fw-bold">Logs (Tail)</div>
                 </div>
-                <button class="btn btn-soft btn-sm" onclick="loadTail()"><i class="bi bi-arrow-clockwise"></i> Refresh</button>
+                <button class="btn btn-soft btn-sm" onclick="loadTail(true)"><i class="bi bi-arrow-clockwise"></i> Refresh</button>
               </div>
               <div class="panel-b">
                 <div class="logbox" id="tailbox">Loading…</div>
@@ -687,6 +736,26 @@ HTML = r"""
               </div>
             </div>
           </div>
+
+          <div class="col-12">
+            <div class="panel">
+              <div class="panel-h">
+                <div class="d-flex align-items-center gap-2">
+                  <i class="bi bi-arrow-left-right" style="color:rgba(6,182,212,.95)"></i>
+                  <div class="fw-bold">Switch Log</div>
+                </div>
+                <div class="d-flex gap-2">
+                  <button class="btn btn-soft btn-sm" onclick="loadSwitchTail(true)"><i class="bi bi-arrow-clockwise"></i> Tail</button>
+                  <button class="btn btn-accent btn-sm" onclick="startSwitchLive()"><i class="bi bi-play-fill"></i> Live</button>
+                  <button class="btn btn-soft btn-sm" onclick="stopSwitchLive()"><i class="bi bi-stop-fill"></i> Stop</button>
+                </div>
+              </div>
+              <div class="panel-b">
+                <div class="logbox" id="switchbox">No switch events yet.</div>
+              </div>
+            </div>
+          </div>
+
         </div>
       </div>
 
@@ -703,17 +772,20 @@ HTML = r"""
   <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 
   <script>
-    // --------------------------
-    // Chart stability knobs
-    // --------------------------
-    const MAX_POINTS = 180;     // hard cap in browser (prevents crashes)
-    const POLL_MS = 2000;       // refresh interval (safe)
+    const MAX_POINTS = 180;
+    const POLL_MS = 2500;
+
     let lastChartKey = "";
+    let lastPrimaryPort = "";
     let chart;
+
+    let refreshing = false;
+    let tunnelsLoading = false;
+    let tailLoading = false;
 
     function toast(msg){
       document.getElementById("toastBody").textContent = msg;
-      const t = new bootstrap.Toast(document.getElementById("toast"), {delay: 2000});
+      const t = new bootstrap.Toast(document.getElementById("toast"), {delay: 1600});
       t.show();
     }
 
@@ -748,15 +820,13 @@ HTML = r"""
         }]},
         options: {
           responsive: true,
-          maintainAspectRatio: false,  // required for fixed chartWrap height
-          animation: false,            // prevents UI lag/crash
+          maintainAspectRatio: false,
+          animation: false,
           normalized: true,
           plugins: {
             legend: { labels: { color: "#9fb0d8" } },
             tooltip: {
-              callbacks: {
-                label: (ctx) => " " + humanBps(ctx.raw || 0)
-              }
+              callbacks: { label: (ctx) => " " + humanBps(ctx.raw || 0) }
             }
           },
           scales: {
@@ -774,15 +844,34 @@ HTML = r"""
       out.textContent = (block + out.textContent).slice(0, 14000);
     }
 
+    // fetch with timeout + credentials
+    async function fetchJson(url, opts={}){
+      const controller = new AbortController();
+      const t = setTimeout(() => controller.abort(), opts.timeoutMs || 9000);
+      try{
+        const res = await fetch(url, {
+          ...opts,
+          signal: controller.signal,
+          credentials: "same-origin"
+        });
+        clearTimeout(t);
+        const j = await res.json();
+        return j;
+      }catch(e){
+        clearTimeout(t);
+        throw e;
+      }
+    }
+
     async function action(actionName, service=null){
       try{
         toast("Executing…");
-        const res = await fetch("/api/action", {
+        const j = await fetchJson("/api/action", {
           method: "POST",
           headers: {"Content-Type":"application/json"},
-          body: JSON.stringify({action: actionName, service})
+          body: JSON.stringify({action: actionName, service}),
+          timeoutMs: 20000
         });
-        const j = await res.json();
         if(!j.ok){
           toast("Error");
           pushOutput("ERROR: " + (j.error || "unknown"));
@@ -790,26 +879,32 @@ HTML = r"""
         }
         toast("Done");
         pushOutput(j.output || "OK");
-        await refreshAll();
-        await loadTunnels();
+        await refreshAll(true);
+        await loadTunnels(true);
+        await loadSwitchTail(false);
       }catch(e){
         toast("Network error");
-        pushOutput("EXCEPTION: " + e);
+        pushOutput("EXCEPTION: " + String(e));
       }
     }
 
-    async function loadTunnels(){
+    async function loadTunnels(manual=false){
+      if(tunnelsLoading) return;
+      tunnelsLoading = true;
+
       const body = document.getElementById("tunnelsBody");
       body.innerHTML = `<tr><td colspan="5" class="tiny">Loading…</td></tr>`;
+
       try{
-        const res = await fetch("/api/tunnels");
-        const j = await res.json();
+        const j = await fetchJson("/api/tunnels", {timeoutMs: 12000});
         if(!j.ok || !j.rows){
           body.innerHTML = `<tr><td colspan="5" class="tiny">Failed to load tunnels.</td></tr>`;
+          tunnelsLoading = false;
           return;
         }
         if(j.rows.length === 0){
           body.innerHTML = `<tr><td colspan="5" class="tiny">No tunnels found.</td></tr>`;
+          tunnelsLoading = false;
           return;
         }
         body.innerHTML = "";
@@ -838,7 +933,10 @@ HTML = r"""
           `);
         }
       }catch(e){
-        body.innerHTML = `<tr><td colspan="5" class="tiny">Error: ${escapeHtml(String(e))}</td></tr>`;
+        body.innerHTML = `<tr><td colspan="5" class="tiny">Network error loading tunnels.</td></tr>`;
+        if(manual) pushOutput("tunnels error: " + String(e));
+      }finally{
+        tunnelsLoading = false;
       }
     }
 
@@ -849,16 +947,21 @@ HTML = r"""
       return (s||"").replaceAll("'","\\'");
     }
 
-    async function loadTail(){
+    async function loadTail(manual=false){
+      if(tailLoading) return;
+      tailLoading = true;
+
       const box = document.getElementById("tailbox");
       box.textContent = "Loading…";
       try{
-        const res = await fetch("/api/logs/tail?lines=300");
-        const j = await res.json();
+        const j = await fetchJson("/api/logs/tail?lines=300", {timeoutMs: 14000});
         box.textContent = j.text || "";
         box.scrollTop = box.scrollHeight;
       }catch(e){
-        box.textContent = "Error: " + e;
+        box.textContent = "Network error.";
+        if(manual) pushOutput("tail error: " + String(e));
+      }finally{
+        tailLoading = false;
       }
     }
 
@@ -889,10 +992,54 @@ HTML = r"""
       }
     }
 
-    async function refreshAll(){
+    // Switch logs
+    let switchSource = null;
+
+    async function loadSwitchTail(manual=false){
+      const box = document.getElementById("switchbox");
+      box.textContent = "Loading…";
       try{
-        const res = await fetch("/api/metrics");
-        const m = await res.json();
+        const j = await fetchJson("/api/switch/tail?lines=250", {timeoutMs: 8000});
+        box.textContent = j.text || "No switch events yet.";
+        box.scrollTop = box.scrollHeight;
+      }catch(e){
+        box.textContent = "Network error.";
+        if(manual) pushOutput("switch tail error: " + String(e));
+      }
+    }
+
+    function startSwitchLive(){
+      stopSwitchLive();
+      const box = document.getElementById("switchbox");
+      box.textContent = "";
+      switchSource = new EventSource("/api/switch/live?lines=80");
+      switchSource.onmessage = (ev) => {
+        box.textContent += ev.data.replaceAll("\\n","\n") + "\n";
+        if(box.textContent.length > 24000){
+          box.textContent = box.textContent.slice(-20000);
+        }
+        box.scrollTop = box.scrollHeight;
+      };
+      switchSource.onerror = () => {
+        box.textContent += "\n[switch stream disconnected]\n";
+      };
+      toast("Switch live started");
+    }
+
+    function stopSwitchLive(){
+      if(switchSource){
+        switchSource.close();
+        switchSource = null;
+        toast("Switch live stopped");
+      }
+    }
+
+    async function refreshAll(manual=false){
+      if(refreshing) return;
+      refreshing = true;
+
+      try{
+        const m = await fetchJson("/api/metrics", {timeoutMs: 9000});
 
         document.getElementById("primary-svc").textContent = m.primary.service || "-";
         document.getElementById("primary-port").textContent = m.primary.port || "-";
@@ -905,7 +1052,16 @@ HTML = r"""
         document.getElementById("kpi-1m").textContent = m.traffic.avg1m.human;
         document.getElementById("kpi-5m").textContent = m.traffic.avg5m.human;
 
-        // Update chart safely
+        // If primary port changed => reset chart key
+        const pport = String(m.primary.port || "");
+        if(pport !== lastPrimaryPort){
+          lastPrimaryPort = pport;
+          lastChartKey = "";
+          chart.data.labels = [];
+          chart.data.datasets[0].data = [];
+          chart.update("none");
+        }
+
         const series = (m.traffic.series || []).slice(-MAX_POINTS);
         const labels = series.map(x => {
           const d = new Date(x.t * 1000);
@@ -913,8 +1069,7 @@ HTML = r"""
         });
         const data = series.map(x => Number(x.bps)).map(v => (Number.isFinite(v) ? v : 0));
 
-        // avoid redundant heavy updates
-        const key = String(labels.length) + ":" + (labels[labels.length-1] || "");
+        const key = String(labels.length) + ":" + (labels[labels.length-1] || "") + ":" + lastPrimaryPort;
         if(key !== lastChartKey){
           lastChartKey = key;
           chart.data.labels = labels;
@@ -923,16 +1078,21 @@ HTML = r"""
         }
 
       }catch(e){
-        pushOutput("metrics error: " + e);
+        if(manual){
+          pushOutput("metrics error: " + String(e));
+        }
+      }finally{
+        refreshing = false;
       }
     }
 
     // boot
     makeChart();
-    loadTunnels();
-    loadTail();
-    refreshAll();
-    setInterval(refreshAll, POLL_MS);
+    loadTunnels(false);
+    loadTail(false);
+    loadSwitchTail(false);
+    refreshAll(false);
+    setInterval(() => refreshAll(false), POLL_MS);
   </script>
 </body>
 </html>
