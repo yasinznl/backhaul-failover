@@ -293,6 +293,16 @@ cmd_current() {
   echo "$primary $pport"
 }
 
+cmd_current_raw() {
+  local primary ptoml pport
+  primary="$(get_primary_from_actives || true)"
+  [[ -n "${primary:-}" ]] || exit 1
+  ptoml="$(get_toml_from_unit "$primary")"
+  pport="$(get_bind_port_from_toml "$ptoml" || true)"
+  [[ -n "${pport:-}" ]] || exit 1
+  printf "%s\t%s\n" "$primary" "$pport"
+}
+
 cmd_watch_traffic() {
   local port="${1:-}"
   local interval="${2:-1}"
@@ -511,6 +521,8 @@ elif [[ "${1:-}" == "--list-raw" ]]; then
   cmd_list_raw; exit 0
 elif [[ "${1:-}" == "--current" ]]; then
   cmd_current; exit 0
+elif [[ "${1:-}" == "--current-raw" ]]; then
+  cmd_current_raw; exit 0
 elif [[ "${1:-}" == "--watch-traffic" ]]; then
   cmd_watch_traffic "${2:-}" "${3:-1}"; exit 0
 elif [[ "${1:-}" == "--switch" ]]; then
