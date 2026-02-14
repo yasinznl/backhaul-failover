@@ -6,6 +6,7 @@ TIMER="backhaul-failover.timer"
 FAILOVER_BIN="/usr/local/bin/backhaul-failover.sh"
 
 WEB_SERVICE="backhaul-failover-web.service"
+SWITCH_LOG="/var/log/backhaul-failover-switch.log"
 
 # -------- UI helpers --------
 have_tput=0
@@ -25,15 +26,20 @@ hr() {
   printf "%*s\n" "$w" "" | tr " " "─"
 }
 
-VERSION="2.1"
+VERSION="2.2"
+
+last_switch_line() {
+  [[ -f "$SWITCH_LOG" ]] || { echo "-"; return; }
+  tail -n 1 "$SWITCH_LOG" 2>/dev/null || echo "-"
+}
 
 render_header() {
   clear
 
-  local primary port timer_state web_state
+  local primary port timer_state web_state lastsw
 
-  primary="$("$FAILOVER_BIN" --current-raw 2>/dev/null | awk '{print $1}' || true)"
-  port="$("$FAILOVER_BIN" --current-raw 2>/dev/null | awk '{print $2}' || true)"
+  primary="$("$FAILOVER_BIN" --current-raw 2>/dev/null | awk -F'\t' '{print $1}' || true)"
+  port="$("$FAILOVER_BIN" --current-raw 2>/dev/null | awk -F'\t' '{print $2}' || true)"
 
   if systemctl is-active --quiet "$TIMER"; then
     timer_state="${GREEN}ACTIVE${RESET}"
@@ -46,6 +52,8 @@ render_header() {
   else
     web_state="${RED}INACTIVE${RESET}"
   fi
+
+  lastsw="$(last_switch_line)"
 
   echo -e "${CYA}"
   echo "██████╗  █████╗  ██████╗██╗  ██╗██╗  ██╗ █████╗ ██╗   ██╗██╗     "
@@ -61,10 +69,9 @@ render_header() {
   echo -e "${BOLD}Primary:${RESET} ${primary:-None} ${port:+(Port :$port)}"
   echo -e "${BOLD}Timer:${RESET} $timer_state"
   echo -e "${BOLD}Web:${RESET} $web_state"
+  echo -e "${BOLD}Last switch:${RESET} ${DIM}${lastsw}${RESET}"
   hr
 }
-
-title(){ render_header; } # backward compatibility
 
 ok(){ echo "${GREEN}✅ $*${RESET}"; }
 warn(){ echo "${YEL}🟡 $*${RESET}"; }
@@ -95,6 +102,16 @@ show_logs_live() {
   echo
   echo "${BOLD}${CYA}== Live logs (Ctrl+C to exit) ==${RESET}"
   journalctl -u "$SERVICE" -f -o cat
+}
+
+show_switch_tail() {
+  echo
+  echo "${BOLD}${CYA}== Switch history (last 200) ==${RESET}"
+  if [[ -f "$SWITCH_LOG" ]]; then
+    tail -n 200 "$SWITCH_LOG" || true
+  else
+    warn "No switch log yet: $SWITCH_LOG"
+  fi
 }
 
 run_once() {
@@ -147,6 +164,13 @@ manage_start_stop_restart() {
   esac
 }
 
+# ---- traffic (robust via list-raw) ----
+get_port_for_service_raw() {
+  local svc="$1"
+  # list-raw is tab-separated: service \t active \t port \t toml
+  "$FAILOVER_BIN" --list-raw 2>/dev/null | awk -F'\t' -v s="$svc" '$1==s {print $3; exit}'
+}
+
 traffic_primary_live() {
   echo
   echo "${BOLD}${CYA}== Live traffic (Primary) ==${RESET}"
@@ -159,8 +183,13 @@ traffic_primary_live() {
   fi
 
   local svc port
-  svc="$(awk '{print $1}' <<<"$cur")"
-  port="$(awk '{print $2}' <<<"$cur")"
+  svc="$(awk -F'\t' '{print $1}' <<<"$cur")"
+  port="$(awk -F'\t' '{print $2}' <<<"$cur")"
+
+  if [[ -z "${port:-}" || "$port" == "-" ]]; then
+    bad "Primary port is not available."
+    return
+  fi
 
   info "Primary: ${BOLD}${svc}${RESET}  Port: ${BOLD}:${port}${RESET}"
   echo "${DIM}Tip: Drop-based failover checks 10m traffic vs previous 10m.${RESET}"
@@ -176,12 +205,12 @@ traffic_choose_live() {
   read -r -p "Enter service name (e.g. backhaul-iran407.service): " svc
   [[ -n "${svc:-}" ]] || { bad "No service entered."; return; }
 
-  local line port
-  line="$("$FAILOVER_BIN" --list 2>/dev/null | awk -v s="$svc" '$1==s {print $0}' | head -n1 || true)"
-  port="$(awk '{print $3}' <<<"$line" 2>/dev/null || true)"
+  local port
+  port="$(get_port_for_service_raw "$svc" || true)"
 
   if [[ -z "${port:-}" || "$port" == "-" ]]; then
     bad "Could not determine port for: $svc"
+    warn "Tip: ensure bind_addr exists in toml and service matches backhaul-iranNNN.service"
     return
   fi
 
@@ -223,6 +252,8 @@ uninstall_all() {
   rm -f /usr/local/bin/backhaul-failover-menu
   rm -f /usr/local/bin/backhaul-failover-web.py
 
+  rm -f "$SWITCH_LOG" 2>/dev/null || true
+
   systemctl daemon-reload
   systemctl reset-failed >/dev/null 2>&1 || true
   ok "Uninstalled."
@@ -237,6 +268,7 @@ while true; do
   echo "  2) Run once (service)"
   echo "  3) Logs (tail)"
   echo "  4) Logs (live)"
+  echo "  4a) Switch history (tail)"
   echo
   echo "${BOLD}${WHT}Scheduler${RESET}"
   echo "  5) Start timer"
@@ -272,6 +304,7 @@ while true; do
     2) run_once; pause ;;
     3) show_logs_tail; pause ;;
     4) show_logs_live ;;
+    4a|4A) show_switch_tail; pause ;;
     5) start_timer; pause ;;
     6) stop_timer; pause ;;
     7) restart_timer; pause ;;
