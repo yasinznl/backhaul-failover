@@ -4,11 +4,10 @@ set -euo pipefail
 SERVICE="backhaul-failover.service"
 TIMER="backhaul-failover.timer"
 FAILOVER_BIN="/usr/local/bin/backhaul-failover.sh"
-
 WEB_SERVICE="backhaul-failover-web.service"
-SWITCH_LOG="/var/log/backhaul-failover-switch.log"
 
-# -------- UI helpers --------
+SWITCH_LOG="/var/log/backhaul-switch.log"
+
 have_tput=0
 command -v tput >/dev/null 2>&1 && have_tput=1
 
@@ -28,32 +27,15 @@ hr() {
 
 VERSION="2.2"
 
-last_switch_line() {
-  [[ -f "$SWITCH_LOG" ]] || { echo "-"; return; }
-  tail -n 1 "$SWITCH_LOG" 2>/dev/null || echo "-"
-}
-
 render_header() {
   clear
 
-  local primary port timer_state web_state lastsw
+  local primary port timer_state web_state
+  primary="$("$FAILOVER_BIN" --current-raw 2>/dev/null | awk '{print $1}' || true)"
+  port="$("$FAILOVER_BIN" --current-raw 2>/dev/null | awk '{print $2}' || true)"
 
-  primary="$("$FAILOVER_BIN" --current-raw 2>/dev/null | awk -F'\t' '{print $1}' || true)"
-  port="$("$FAILOVER_BIN" --current-raw 2>/dev/null | awk -F'\t' '{print $2}' || true)"
-
-  if systemctl is-active --quiet "$TIMER"; then
-    timer_state="${GREEN}ACTIVE${RESET}"
-  else
-    timer_state="${RED}INACTIVE${RESET}"
-  fi
-
-  if systemctl is-active --quiet "$WEB_SERVICE"; then
-    web_state="${GREEN}ACTIVE${RESET}"
-  else
-    web_state="${RED}INACTIVE${RESET}"
-  fi
-
-  lastsw="$(last_switch_line)"
+  if systemctl is-active --quiet "$TIMER"; then timer_state="${GREEN}ACTIVE${RESET}"; else timer_state="${RED}INACTIVE${RESET}"; fi
+  if systemctl is-active --quiet "$WEB_SERVICE"; then web_state="${GREEN}ACTIVE${RESET}"; else web_state="${RED}INACTIVE${RESET}"; fi
 
   echo -e "${CYA}"
   echo "██████╗  █████╗  ██████╗██╗  ██╗██╗  ██╗ █████╗ ██╗   ██╗██╗     "
@@ -69,7 +51,6 @@ render_header() {
   echo -e "${BOLD}Primary:${RESET} ${primary:-None} ${port:+(Port :$port)}"
   echo -e "${BOLD}Timer:${RESET} $timer_state"
   echo -e "${BOLD}Web:${RESET} $web_state"
-  echo -e "${BOLD}Last switch:${RESET} ${DIM}${lastsw}${RESET}"
   hr
 }
 
@@ -102,16 +83,6 @@ show_logs_live() {
   echo
   echo "${BOLD}${CYA}== Live logs (Ctrl+C to exit) ==${RESET}"
   journalctl -u "$SERVICE" -f -o cat
-}
-
-show_switch_tail() {
-  echo
-  echo "${BOLD}${CYA}== Switch history (last 200) ==${RESET}"
-  if [[ -f "$SWITCH_LOG" ]]; then
-    tail -n 200 "$SWITCH_LOG" || true
-  else
-    warn "No switch log yet: $SWITCH_LOG"
-  fi
 }
 
 run_once() {
@@ -164,13 +135,6 @@ manage_start_stop_restart() {
   esac
 }
 
-# ---- traffic (robust via list-raw) ----
-get_port_for_service_raw() {
-  local svc="$1"
-  # list-raw is tab-separated: service \t active \t port \t toml
-  "$FAILOVER_BIN" --list-raw 2>/dev/null | awk -F'\t' -v s="$svc" '$1==s {print $3; exit}'
-}
-
 traffic_primary_live() {
   echo
   echo "${BOLD}${CYA}== Live traffic (Primary) ==${RESET}"
@@ -183,16 +147,10 @@ traffic_primary_live() {
   fi
 
   local svc port
-  svc="$(awk -F'\t' '{print $1}' <<<"$cur")"
-  port="$(awk -F'\t' '{print $2}' <<<"$cur")"
-
-  if [[ -z "${port:-}" || "$port" == "-" ]]; then
-    bad "Primary port is not available."
-    return
-  fi
+  svc="$(awk '{print $1}' <<<"$cur")"
+  port="$(awk '{print $2}' <<<"$cur")"
 
   info "Primary: ${BOLD}${svc}${RESET}  Port: ${BOLD}:${port}${RESET}"
-  echo "${DIM}Tip: Drop-based failover checks 10m traffic vs previous 10m.${RESET}"
   echo
   "$FAILOVER_BIN" --watch-traffic "$port" 1
 }
@@ -205,12 +163,12 @@ traffic_choose_live() {
   read -r -p "Enter service name (e.g. backhaul-iran407.service): " svc
   [[ -n "${svc:-}" ]] || { bad "No service entered."; return; }
 
-  local port
-  port="$(get_port_for_service_raw "$svc" || true)"
+  local line port
+  line="$("$FAILOVER_BIN" --list 2>/dev/null | awk -v s="$svc" '$1==s {print $0}' | head -n1 || true)"
+  port="$(awk '{print $3}' <<<"$line" 2>/dev/null || true)"
 
   if [[ -z "${port:-}" || "$port" == "-" ]]; then
     bad "Could not determine port for: $svc"
-    warn "Tip: ensure bind_addr exists in toml and service matches backhaul-iranNNN.service"
     return
   fi
 
@@ -219,7 +177,16 @@ traffic_choose_live() {
   "$FAILOVER_BIN" --watch-traffic "$port" 1
 }
 
-# ---- Web panel helpers ----
+switch_history() {
+  echo
+  echo "${BOLD}${CYA}== Switch history ==${RESET}"
+  if [[ ! -f "$SWITCH_LOG" ]]; then
+    warn "No switch log yet: $SWITCH_LOG"
+    return
+  fi
+  tail -n 200 "$SWITCH_LOG" || true
+}
+
 web_status() { systemctl status "$WEB_SERVICE" --no-pager -l || true; }
 web_restart() { systemctl restart "$WEB_SERVICE" || true; ok "Web panel restarted: $WEB_SERVICE"; }
 web_start() { systemctl start "$WEB_SERVICE" || true; ok "Web panel started: $WEB_SERVICE"; }
@@ -234,32 +201,6 @@ web_show_addr() {
   info "Web: http://${ip}:${port}  (default user/pass: admin/admin)"
 }
 
-uninstall_all() {
-  warn "This will remove service, timer, web panel, and binaries."
-  read -r -p "Type YES to uninstall: " ans
-  [[ "$ans" == "YES" ]] || { bad "Cancelled."; return; }
-
-  systemctl disable --now "$TIMER" >/dev/null || true
-  systemctl stop "$SERVICE" >/dev/null 2>&1 || true
-
-  systemctl disable --now "$WEB_SERVICE" >/dev/null || true
-  systemctl stop "$WEB_SERVICE" >/dev/null 2>&1 || true
-
-  rm -f /etc/systemd/system/backhaul-failover.service
-  rm -f /etc/systemd/system/backhaul-failover.timer
-  rm -f /etc/systemd/system/backhaul-failover-web.service
-  rm -f /usr/local/bin/backhaul-failover.sh
-  rm -f /usr/local/bin/backhaul-failover-menu
-  rm -f /usr/local/bin/backhaul-failover-web.py
-
-  rm -f "$SWITCH_LOG" 2>/dev/null || true
-
-  systemctl daemon-reload
-  systemctl reset-failed >/dev/null 2>&1 || true
-  ok "Uninstalled."
-  exit 0
-}
-
 while true; do
   render_header
 
@@ -268,7 +209,6 @@ while true; do
   echo "  2) Run once (service)"
   echo "  3) Logs (tail)"
   echo "  4) Logs (live)"
-  echo "  4a) Switch history (tail)"
   echo
   echo "${BOLD}${WHT}Scheduler${RESET}"
   echo "  5) Start timer"
@@ -286,15 +226,16 @@ while true; do
   echo "  13) Live traffic (Primary)"
   echo "  14) Live traffic (Choose tunnel)"
   echo
-  echo "${BOLD}${WHT}Web Panel${RESET}"
-  echo "  15) Web status"
-  echo "  16) Web start"
-  echo "  17) Web stop"
-  echo "  18) Web restart"
-  echo "  19) Show web address"
+  echo "${BOLD}${WHT}Switch Log${RESET}"
+  echo "  15) Switch history"
   echo
-  echo "${BOLD}${WHT}System${RESET}"
-  echo "  20) Uninstall"
+  echo "${BOLD}${WHT}Web Panel${RESET}"
+  echo "  16) Web status"
+  echo "  17) Web start"
+  echo "  18) Web stop"
+  echo "  19) Web restart"
+  echo "  20) Show web address"
+  echo
   echo "  0) Exit"
   echo
   read -r -p "Select: " choice
@@ -304,7 +245,6 @@ while true; do
     2) run_once; pause ;;
     3) show_logs_tail; pause ;;
     4) show_logs_live ;;
-    4a|4A) show_switch_tail; pause ;;
     5) start_timer; pause ;;
     6) stop_timer; pause ;;
     7) restart_timer; pause ;;
@@ -315,12 +255,12 @@ while true; do
     12) manage_start_stop_restart; pause ;;
     13) traffic_primary_live ;;
     14) traffic_choose_live ;;
-    15) web_status; pause ;;
-    16) web_start; pause ;;
-    17) web_stop; pause ;;
-    18) web_restart; pause ;;
-    19) web_show_addr; pause ;;
-    20) uninstall_all ;;
+    15) switch_history; pause ;;
+    16) web_status; pause ;;
+    17) web_start; pause ;;
+    18) web_stop; pause ;;
+    19) web_restart; pause ;;
+    20) web_show_addr; pause ;;
     0) exit 0 ;;
     *) bad "Invalid option"; pause ;;
   esac
