@@ -10,9 +10,11 @@ Environment=BH_WEB_PASS=admin
 Environment=BH_WEB_PORT=8088
 Environment=BH_TRAFFIC_DIR=/run/backhaul-traffic
 Environment=BH_MAX_SERIES_POINTS=240
+Environment=BH_SWITCH_LOG=/var/log/backhaul-failover-switch.log
 ExecStart=/usr/bin/env python3 /usr/local/bin/backhaul-failover-web.py
 Restart=always
 RestartSec=2
+
 
 [Install]
 WantedBy=multi-user.target
