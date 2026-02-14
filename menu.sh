@@ -32,8 +32,8 @@ render_header() {
 
   local primary port timer_state web_state
 
-  primary="$("$FAILOVER_BIN" --current 2>/dev/null | awk '{print $1}' || true)"
-  port="$("$FAILOVER_BIN" --current 2>/dev/null | awk '{print $2}' || true)"
+  primary="$("$FAILOVER_BIN" --current-raw 2>/dev/null | awk '{print $1}' || true)"
+  port="$("$FAILOVER_BIN" --current-raw 2>/dev/null | awk '{print $2}' || true)"
 
   if systemctl is-active --quiet "$TIMER"; then
     timer_state="${GREEN}ACTIVE${RESET}"
@@ -152,7 +152,7 @@ traffic_primary_live() {
   echo "${BOLD}${CYA}== Live traffic (Primary) ==${RESET}"
 
   local cur
-  cur="$("$FAILOVER_BIN" --current 2>/dev/null || true)"
+  cur="$("$FAILOVER_BIN" --current-raw 2>/dev/null || true)"
   if [[ -z "${cur:-}" ]]; then
     bad "No active primary detected."
     return
