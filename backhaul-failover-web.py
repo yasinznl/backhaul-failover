@@ -13,14 +13,20 @@ SERVICE_FAILOVER = os.environ.get("BH_FAILOVER_SERVICE", "backhaul-failover.serv
 TIMER_FAILOVER = os.environ.get("BH_FAILOVER_TIMER", "backhaul-failover.timer")
 SERVICE_WEB = os.environ.get("BH_WEB_SERVICE", "backhaul-failover-web.service")
 
+# Basic Auth
 WEB_USER = os.environ.get("BH_WEB_USER", "admin")
 WEB_PASS = os.environ.get("BH_WEB_PASS", "admin")
 
+# Listen
 WEB_HOST = os.environ.get("BH_WEB_HOST", "0.0.0.0")
 WEB_PORT = int(os.environ.get("BH_WEB_PORT", "8088"))
 
+# Traffic log dir
 TRAFFIC_DIR = os.environ.get("BH_TRAFFIC_DIR", "/run/backhaul-traffic")
 MAX_SERIES_POINTS = int(os.environ.get("BH_MAX_SERIES_POINTS", "240"))
+
+# Switch log
+SWITCH_LOG = os.environ.get("BH_SWITCH_LOG", "/var/log/backhaul-switch.log")
 
 app = Flask(__name__)
 
@@ -47,7 +53,7 @@ def guard():
 # -----------------------------
 def get_current_primary() -> Tuple[str, str]:
     """
-    Use --current-raw (tab separated) to avoid log pollution.
+    Use --current-raw to avoid log pollution.
     Expected: "backhaul-iran403.service\t403"
     """
     try:
@@ -55,13 +61,11 @@ def get_current_primary() -> Tuple[str, str]:
         s = (p.stdout or "").strip()
         if not s:
             return "-", "-"
-        # Some environments may print extra lines; pick the last line that matches pattern
         lines = [ln.strip() for ln in s.splitlines() if ln.strip()]
         for ln in reversed(lines):
             parts = ln.split("\t")
             if len(parts) >= 2 and parts[0].endswith(".service") and parts[1].isdigit():
                 return parts[0], parts[1]
-            # fallback: whitespace
             w = ln.split()
             if len(w) >= 2 and w[0].endswith(".service") and w[1].isdigit():
                 return w[0], w[1]
@@ -137,39 +141,28 @@ def points_to_bps(points: List[Tuple[int, int]]) -> List[Tuple[int, float]]:
     for ts, b in points[1:]:
         dt = ts - prev_ts
         db = b - prev_b
-        # move baseline early (important for resets)
         prev_ts, prev_b = ts, b
-
         if dt <= 0:
             continue
         if db < 0:
-            # counter reset / conn rotation; just skip this step
             continue
         out.append((ts, db / dt))
     return out
-
-def human_bps(bps: float) -> str:
-    if bps < 1024:
-        return f"{bps:.0f} B/s"
-    kb = bps / 1024
-    if kb < 1024:
-        return f"{kb:.1f} KB/s"
-    mb = kb / 1024
-    if mb < 1024:
-        return f"{mb:.2f} MB/s"
-    gb = mb / 1024
-    return f"{gb:.2f} GB/s"
 
 def avg(values: List[float]) -> float:
     if not values:
         return 0.0
     return sum(values) / len(values)
 
-# ---- Python sampler (FIX: keep chart alive) ----
+# ---- Mbps helpers ----
+def bps_to_mbps(bytes_per_sec: float) -> float:
+    return (bytes_per_sec * 8.0) / 1_000_000.0
+
+def human_mbps(bytes_per_sec: float) -> str:
+    return f"{bps_to_mbps(bytes_per_sec):.2f} Mbps"
+
+# ---- Python sampler (keeps chart alive even if timer is slow) ----
 def get_port_bytes_sum_now(port: str) -> int:
-    """
-    Sum bytes_received + bytes_acked for TCP sessions on sport=:port.
-    """
     try:
         p = run(["ss", "-tinH", f"( sport = :{port} )"], timeout=3)
         out = p.stdout or ""
@@ -198,8 +191,7 @@ def traffic_record_sample_py(port: str) -> None:
     try:
         with open(path, "a", encoding="utf-8") as f:
             f.write(f"{ts} {b}\n")
-        # trim
-        lines = read_last_lines(path, max_lines=400)
+        lines = read_last_lines(path, max_lines=500)
         with open(path, "w", encoding="utf-8") as f:
             f.writelines(lines)
     except Exception:
@@ -253,13 +245,33 @@ def api_logs_live():
     return Response(stream(), mimetype="text/event-stream")
 
 # -----------------------------
-# Metrics (FIX)
+# Switch log API
+# -----------------------------
+@app.get("/api/switch-log")
+def api_switch_log():
+    lines = int(request.args.get("lines", "200"))
+    if lines < 1:
+        lines = 1
+    if lines > 2000:
+        lines = 2000
+
+    if not os.path.exists(SWITCH_LOG):
+        return jsonify({"ok": True, "text": ""})
+
+    try:
+        last = read_last_lines(SWITCH_LOG, max_lines=lines)
+        return jsonify({"ok": True, "text": "".join(last)})
+    except Exception as e:
+        return jsonify({"ok": False, "text": f"[switch log error] {e}"}), 500
+
+# -----------------------------
+# Metrics
 # -----------------------------
 @app.get("/api/metrics")
 def api_metrics():
     primary_svc, primary_port = get_current_primary()
 
-    # Always record a sample so chart works even if timer is slow / restarted
+    # Always take a sample so UI is never empty
     if primary_port not in ("", "-"):
         traffic_record_sample_py(primary_port)
 
@@ -270,7 +282,7 @@ def api_metrics():
 
     if primary_port not in ("", "-"):
         path = traffic_log_path(primary_port)
-        lines = read_last_lines(path, max_lines=MAX_SERIES_POINTS + 10)
+        lines = read_last_lines(path, max_lines=MAX_SERIES_POINTS + 20)
         pts = parse_points(lines)
         bps_pts = points_to_bps(pts)
 
@@ -293,10 +305,10 @@ def api_metrics():
             "web": "active" if is_active(SERVICE_WEB) else "inactive",
         },
         "traffic": {
-            "series": series,
-            "now": {"bps": now_bps, "human": human_bps(now_bps)},
-            "avg1m": {"bps": avg_60, "human": human_bps(avg_60)},
-            "avg5m": {"bps": avg_300, "human": human_bps(avg_300)},
+            "series": series,  # bps is BYTES/s
+            "now":  {"bps": now_bps,  "mbps": bps_to_mbps(now_bps),  "human": human_mbps(now_bps)},
+            "avg1m":{"bps": avg_60,   "mbps": bps_to_mbps(avg_60),   "human": human_mbps(avg_60)},
+            "avg5m":{"bps": avg_300,  "mbps": bps_to_mbps(avg_300),  "human": human_mbps(avg_300)},
         }
     }
     return jsonify(data)
@@ -346,7 +358,7 @@ def api_action():
             return jsonify({"ok": False, "error": "Missing service name"}), 400
 
         if action == "switch":
-            out = run([FAILOVER_BIN, "--switch", svc], timeout=70).stdout or ""
+            out = run([FAILOVER_BIN, "--switch", svc], timeout=90).stdout or ""
             return jsonify({"ok": True, "output": out[-8000:] if out else "Switch command completed."})
 
         if action == "tunnel_start":
@@ -371,7 +383,8 @@ def api_action():
 # -----------------------------
 # UI
 # -----------------------------
-HTML = r"""<!doctype html>
+HTML = r"""
+<!doctype html>
 <html lang="en" dir="ltr">
 <head>
   <meta charset="utf-8">
@@ -386,19 +399,17 @@ HTML = r"""<!doctype html>
     :root{
       --bg0:#060812;
       --bg1:#0b1220;
-      --card:#0f1a33;
-      --card2:#0b162d;
       --line:rgba(90,120,200,.22);
       --text:#eaf0ff;
       --muted:#9fb0d8;
       --good:#22c55e;
-      --warn:#f59e0b;
       --bad:#ef4444;
       --accent:#7c3aed;
       --accent2:#06b6d4;
       --shadow: 0 14px 40px rgba(0,0,0,.35);
       --r:18px;
     }
+
     body{
       background:
         radial-gradient(900px 600px at 15% 10%, rgba(124,58,237,.22), transparent 60%),
@@ -407,34 +418,139 @@ HTML = r"""<!doctype html>
       color: var(--text);
       min-height:100vh;
     }
-    .topbar{ position: sticky; top: 0; z-index: 50; backdrop-filter: blur(10px); background: rgba(6,8,18,.55); border-bottom: 1px solid var(--line); }
+
+    .topbar{
+      position: sticky; top: 0; z-index: 50;
+      backdrop-filter: blur(10px);
+      background: rgba(6,8,18,.55);
+      border-bottom: 1px solid var(--line);
+    }
+
     .brand{ font-weight: 900; letter-spacing: .3px; font-size: 1.05rem; }
     .subbrand{ color: var(--muted); font-size: .85rem; }
-    .chip{ border: 1px solid var(--line); background: rgba(15,26,51,.55); border-radius: 999px; padding: .35rem .7rem; display: inline-flex; align-items: center; gap: .45rem; font-size: .85rem; color: var(--muted); }
+
+    .chip{
+      border: 1px solid var(--line);
+      background: rgba(15,26,51,.55);
+      border-radius: 999px;
+      padding: .35rem .7rem;
+      display: inline-flex;
+      align-items: center;
+      gap: .45rem;
+      font-size: .85rem;
+      color: var(--muted);
+    }
     .dot{ width:10px; height:10px; border-radius:50%; display:inline-block; }
     .dot.good{ background: var(--good); box-shadow: 0 0 0 4px rgba(34,197,94,.12); }
     .dot.bad{  background: var(--bad);  box-shadow: 0 0 0 4px rgba(239,68,68,.12); }
-    .panel{ background: linear-gradient(180deg, rgba(15,26,51,.92), rgba(11,22,45,.92)); border: 1px solid var(--line); border-radius: var(--r); box-shadow: var(--shadow); overflow: hidden; }
-    .panel-h{ padding: 14px 16px; border-bottom: 1px solid var(--line); display:flex; justify-content:space-between; align-items:center; gap:10px; }
+
+    .panel{
+      background: linear-gradient(180deg, rgba(15,26,51,.92), rgba(11,22,45,.92));
+      border: 1px solid var(--line);
+      border-radius: var(--r);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+    .panel-h{
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--line);
+      display:flex; justify-content:space-between; align-items:center; gap:10px;
+    }
     .panel-b{ padding: 14px 16px; }
-    .btn-soft{ border-radius: 14px; border: 1px solid var(--line); background: rgba(15,26,51,.45); color: var(--text); }
+
+    .btn-soft{
+      border-radius: 14px;
+      border: 1px solid var(--line);
+      background: rgba(15,26,51,.45);
+      color: var(--text);
+    }
     .btn-soft:hover{ border-color: rgba(124,58,237,.85); }
-    .btn-accent{ border-radius: 14px; border: 1px solid rgba(124,58,237,.75); background: rgba(124,58,237,.18); color: var(--text); }
-    .btn-danger-soft{ border-radius: 14px; border: 1px solid rgba(239,68,68,.55); background: rgba(239,68,68,.12); color: var(--text); }
-    .kpi{ border: 1px solid var(--line); background: rgba(8,12,24,.35); border-radius: 16px; padding: 12px; }
+    .btn-accent{
+      border-radius: 14px;
+      border: 1px solid rgba(124,58,237,.75);
+      background: rgba(124,58,237,.18);
+      color: var(--text);
+    }
+    .btn-danger-soft{
+      border-radius: 14px;
+      border: 1px solid rgba(239,68,68,.55);
+      background: rgba(239,68,68,.12);
+      color: var(--text);
+    }
+
+    .kpi{
+      border: 1px solid var(--line);
+      background: rgba(8,12,24,.35);
+      border-radius: 16px;
+      padding: 12px;
+    }
     .kpi .label{ color: var(--muted); font-size: .85rem; }
     .kpi .value{ font-size: 1.2rem; font-weight: 900; letter-spacing:.2px; }
     .kpi .sub{ color: var(--muted); font-size: .8rem; }
-    .logbox{ height: 360px; overflow: auto; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12.5px; line-height: 1.45; background: rgba(6,8,18,.6); border: 1px solid var(--line); border-radius: 16px; padding: 12px; white-space: pre-wrap; }
-    .table-dark{ --bs-table-bg: transparent; --bs-table-color: var(--text); --bs-table-border-color: var(--line); }
-    .table thead th{ color: var(--muted); font-weight: 800; border-bottom: 1px solid var(--line) !important; }
-    .table tbody td{ border-top: 1px solid rgba(90,120,200,.18) !important; vertical-align: middle; }
-    .chartWrap{ position: relative; width: 100%; height: 320px; overflow: hidden; border-radius: 16px; border: 1px solid var(--line); background: rgba(6,8,18,.35); }
-    @media (max-width: 576px){ .chartWrap{ height: 240px; } .logbox{ height: 300px; } .kpi .value{ font-size: 1.05rem; } }
+
+    .logbox{
+      height: 360px;
+      overflow: auto;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 12.5px;
+      line-height: 1.45;
+      background: rgba(6,8,18,.6);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 12px;
+      white-space: pre-wrap;
+    }
+
+    .table-dark{
+      --bs-table-bg: transparent;
+      --bs-table-color: var(--text);
+      --bs-table-border-color: var(--line);
+    }
+    .table thead th{
+      color: var(--muted);
+      font-weight: 800;
+      border-bottom: 1px solid var(--line) !important;
+    }
+    .table tbody td{
+      border-top: 1px solid rgba(90,120,200,.18) !important;
+      vertical-align: middle;
+    }
+
+    .chartWrap{
+      position: relative;
+      width: 100%;
+      height: 320px;
+      overflow: hidden;
+      border-radius: 16px;
+      border: 1px solid var(--line);
+      background: rgba(6,8,18,.35);
+    }
+    @media (max-width: 576px){
+      .chartWrap{ height: 240px; }
+      .logbox{ height: 300px; }
+      .kpi .value{ font-size: 1.05rem; }
+    }
+
     .toast-container{ z-index: 9999; }
-    .toast{ background: rgba(15,26,51,.96); border: 1px solid var(--line); color: var(--text); border-radius: 16px; box-shadow: var(--shadow); }
-    .nav-pills .nav-link{ color: var(--muted); border-radius: 14px; border: 1px solid rgba(90,120,200,.18); background: rgba(15,26,51,.35); }
-    .nav-pills .nav-link.active{ color: var(--text); border-color: rgba(124,58,237,.9); background: rgba(124,58,237,.2); }
+    .toast{
+      background: rgba(15,26,51,.96);
+      border: 1px solid var(--line);
+      color: var(--text);
+      border-radius: 16px;
+      box-shadow: var(--shadow);
+    }
+
+    .nav-pills .nav-link{
+      color: var(--muted);
+      border-radius: 14px;
+      border: 1px solid rgba(90,120,200,.18);
+      background: rgba(15,26,51,.35);
+    }
+    .nav-pills .nav-link.active{
+      color: var(--text);
+      border-color: rgba(124,58,237,.9);
+      background: rgba(124,58,237,.2);
+    }
     .tiny{ color: var(--muted); font-size: .85rem; }
   </style>
 </head>
@@ -474,6 +590,7 @@ HTML = r"""<!doctype html>
     </div>
 
     <div class="tab-content">
+      <!-- Dashboard -->
       <div class="tab-pane fade show active" id="tab-dashboard">
         <div class="row g-3">
           <div class="col-12 col-lg-5">
@@ -496,17 +613,17 @@ HTML = r"""<!doctype html>
                   <div class="col-4"><div class="kpi">
                     <div class="label">Now</div>
                     <div class="value" id="kpi-now">…</div>
-                    <div class="sub">instant</div>
+                    <div class="sub">Mbps</div>
                   </div></div>
                   <div class="col-4"><div class="kpi">
                     <div class="label">Avg 1m</div>
                     <div class="value" id="kpi-1m">…</div>
-                    <div class="sub">rolling</div>
+                    <div class="sub">Mbps</div>
                   </div></div>
                   <div class="col-4"><div class="kpi">
                     <div class="label">Avg 5m</div>
                     <div class="value" id="kpi-5m">…</div>
-                    <div class="sub">rolling</div>
+                    <div class="sub">Mbps</div>
                   </div></div>
                 </div>
 
@@ -514,6 +631,7 @@ HTML = r"""<!doctype html>
                   <button class="btn btn-accent btn-sm" onclick="refreshAll(true)"><i class="bi bi-arrow-clockwise"></i> Refresh</button>
                   <button class="btn btn-soft btn-sm" onclick="loadTunnels()"><i class="bi bi-diagram-3-fill"></i> Reload tunnels</button>
                   <button class="btn btn-soft btn-sm" onclick="loadTail()"><i class="bi bi-journal-text"></i> Refresh logs</button>
+                  <button class="btn btn-soft btn-sm" onclick="loadSwitchLog()"><i class="bi bi-clock-history"></i> Switch log</button>
                 </div>
               </div>
             </div>
@@ -526,20 +644,34 @@ HTML = r"""<!doctype html>
                   <i class="bi bi-activity" style="color:rgba(124,58,237,.95)"></i>
                   <div class="fw-bold">Live Traffic</div>
                 </div>
-                <div class="tiny">stable chart • capped points</div>
+                <div class="tiny">Mbps • capped points</div>
               </div>
               <div class="panel-b">
                 <div class="chartWrap">
                   <canvas id="chart"></canvas>
                 </div>
-                <div class="tiny mt-2">
-                  Source: {{TRAFFIC_DIR}}/port-&lt;PORT&gt;.log
-                </div>
+                <div class="tiny mt-2">Source: {{TRAFFIC_DIR}}/port-&lt;PORT&gt;.log</div>
               </div>
             </div>
           </div>
 
-          <div class="col-12">
+          <div class="col-12 col-lg-6">
+            <div class="panel">
+              <div class="panel-h">
+                <div class="d-flex align-items-center gap-2">
+                  <i class="bi bi-clock-history" style="color:rgba(6,182,212,.95)"></i>
+                  <div class="fw-bold">Switch History</div>
+                </div>
+                <button class="btn btn-soft btn-sm" onclick="loadSwitchLog()"><i class="bi bi-arrow-clockwise"></i> Refresh</button>
+              </div>
+              <div class="panel-b">
+                <div class="logbox" id="switchbox">Loading…</div>
+                <div class="tiny mt-2">File: /var/log/backhaul-switch.log</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="col-12 col-lg-6">
             <div class="panel">
               <div class="panel-h">
                 <div class="d-flex align-items-center gap-2">
@@ -553,9 +685,11 @@ HTML = r"""<!doctype html>
               </div>
             </div>
           </div>
+
         </div>
       </div>
 
+      <!-- Tunnels -->
       <div class="tab-pane fade" id="tab-tunnels">
         <div class="panel">
           <div class="panel-h">
@@ -582,11 +716,12 @@ HTML = r"""<!doctype html>
                 </tbody>
               </table>
             </div>
-            <div class="tiny">Switch will only finalize if the target becomes healthy (your script logic).</div>
+            <div class="tiny">Switch will only finalize if the target becomes healthy.</div>
           </div>
         </div>
       </div>
 
+      <!-- Logs -->
       <div class="tab-pane fade" id="tab-logs">
         <div class="row g-3">
           <div class="col-12 col-lg-6">
@@ -641,7 +776,6 @@ HTML = r"""<!doctype html>
     let lastChartKey = "";
     let chart;
     let liveSource = null;
-
     let refreshBusy = false;
 
     function toast(msg){
@@ -658,14 +792,18 @@ HTML = r"""<!doctype html>
       dot.classList.add(state === "active" ? "good" : "bad");
     }
 
-    function humanBps(bps){
-      if (bps < 1024) return `${bps.toFixed(0)} B/s`;
-      const kb = bps/1024;
-      if (kb < 1024) return `${kb.toFixed(1)} KB/s`;
-      const mb = kb/1024;
-      if (mb < 1024) return `${mb.toFixed(2)} MB/s`;
-      const gb = mb/1024;
-      return `${gb.toFixed(2)} GB/s`;
+    function pushOutput(text){
+      const out = document.getElementById("outbox");
+      const now = new Date().toLocaleString();
+      const block = `[${now}] ${text}\n\n`;
+      out.textContent = (block + out.textContent).slice(0, 14000);
+    }
+
+    function escapeHtml(s){
+      return (s||"").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");
+    }
+    function escapeAttr(s){
+      return (s||"").replaceAll("'","\\'");
     }
 
     function makeChart(){
@@ -673,7 +811,7 @@ HTML = r"""<!doctype html>
       chart = new Chart(ctx, {
         type: "line",
         data: { labels: [], datasets: [{
-          label: "Traffic (B/s)",
+          label: "Traffic (Mbps)",
           data: [],
           borderWidth: 2,
           tension: 0.25,
@@ -686,7 +824,11 @@ HTML = r"""<!doctype html>
           normalized: true,
           plugins: {
             legend: { labels: { color: "#9fb0d8" } },
-            tooltip: { callbacks: { label: (ctx) => " " + humanBps(ctx.raw || 0) } }
+            tooltip: {
+              callbacks: {
+                label: (ctx) => " " + Number(ctx.raw || 0).toFixed(2) + " Mbps"
+              }
+            }
           },
           scales: {
             x: { ticks: { color: "#9fb0d8", maxTicksLimit: 8 }, grid: { color: "rgba(90,120,200,.15)" } },
@@ -694,13 +836,6 @@ HTML = r"""<!doctype html>
           }
         }
       });
-    }
-
-    function pushOutput(text){
-      const out = document.getElementById("outbox");
-      const now = new Date().toLocaleString();
-      const block = `[${now}] ${text}\n\n`;
-      out.textContent = (block + out.textContent).slice(0, 14000);
     }
 
     async function action(actionName, service=null){
@@ -722,6 +857,7 @@ HTML = r"""<!doctype html>
         pushOutput(j.output || "OK");
         await refreshAll(true);
         await loadTunnels();
+        await loadSwitchLog();
       }catch(e){
         toast("Network error");
         pushOutput("EXCEPTION: " + e);
@@ -772,18 +908,24 @@ HTML = r"""<!doctype html>
       }
     }
 
-    function escapeHtml(s){
-      return (s||"").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");
-    }
-    function escapeAttr(s){
-      return (s||"").replaceAll("'","\\'");
-    }
-
     async function loadTail(){
       const box = document.getElementById("tailbox");
       box.textContent = "Loading…";
       try{
         const res = await fetch("/api/logs/tail?lines=300", { credentials: "same-origin" });
+        const j = await res.json();
+        box.textContent = j.text || "";
+        box.scrollTop = box.scrollHeight;
+      }catch(e){
+        box.textContent = "Error: " + e;
+      }
+    }
+
+    async function loadSwitchLog(){
+      const box = document.getElementById("switchbox");
+      box.textContent = "Loading…";
+      try{
+        const res = await fetch("/api/switch-log?lines=200", { credentials: "same-origin" });
         const j = await res.json();
         box.textContent = j.text || "";
         box.scrollTop = box.scrollHeight;
@@ -831,16 +973,19 @@ HTML = r"""<!doctype html>
         setDot("dot-timer","st-timer", m.units.timer);
         setDot("dot-web","st-web", m.units.web);
 
-        document.getElementById("kpi-now").textContent = m.traffic.now.human;
-        document.getElementById("kpi-1m").textContent = m.traffic.avg1m.human;
-        document.getElementById("kpi-5m").textContent = m.traffic.avg5m.human;
+        document.getElementById("kpi-now").textContent = (m.traffic.now && m.traffic.now.mbps !== undefined) ? Number(m.traffic.now.mbps).toFixed(2) : "0.00";
+        document.getElementById("kpi-1m").textContent  = (m.traffic.avg1m && m.traffic.avg1m.mbps !== undefined) ? Number(m.traffic.avg1m.mbps).toFixed(2) : "0.00";
+        document.getElementById("kpi-5m").textContent  = (m.traffic.avg5m && m.traffic.avg5m.mbps !== undefined) ? Number(m.traffic.avg5m.mbps).toFixed(2) : "0.00";
 
+        // series is bytes/s -> convert to Mbps for chart
         const series = (m.traffic.series || []).slice(-MAX_POINTS);
         const labels = series.map(x => {
           const d = new Date(x.t * 1000);
           return d.toLocaleTimeString(undefined, {hour:"2-digit", minute:"2-digit", second:"2-digit"});
         });
-        const data = series.map(x => Number(x.bps)).map(v => (Number.isFinite(v) ? v : 0));
+        const data = series
+          .map(x => Number(x.bps))
+          .map(v => (Number.isFinite(v) ? (v * 8 / 1_000_000) : 0));
 
         const key = String(labels.length) + ":" + (labels[labels.length-1] || "");
         if(key !== lastChartKey){
@@ -860,6 +1005,7 @@ HTML = r"""<!doctype html>
     makeChart();
     loadTunnels();
     loadTail();
+    loadSwitchLog();
     refreshAll(true);
     setInterval(() => refreshAll(false), POLL_MS);
   </script>
