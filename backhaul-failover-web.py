@@ -2,7 +2,7 @@
 import os
 import time
 import subprocess
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple
 from flask import Flask, request, Response, jsonify, render_template_string
 
 # -----------------------------
@@ -13,29 +13,18 @@ SERVICE_FAILOVER = os.environ.get("BH_FAILOVER_SERVICE", "backhaul-failover.serv
 TIMER_FAILOVER = os.environ.get("BH_FAILOVER_TIMER", "backhaul-failover.timer")
 SERVICE_WEB = os.environ.get("BH_WEB_SERVICE", "backhaul-failover-web.service")
 
-# Basic Auth
 WEB_USER = os.environ.get("BH_WEB_USER", "admin")
 WEB_PASS = os.environ.get("BH_WEB_PASS", "admin")
 
-# Listen
 WEB_HOST = os.environ.get("BH_WEB_HOST", "0.0.0.0")
 WEB_PORT = int(os.environ.get("BH_WEB_PORT", "8088"))
 
-# Traffic log dir from your failover script
 TRAFFIC_DIR = os.environ.get("BH_TRAFFIC_DIR", "/run/backhaul-traffic")
-
-# How many points to return to chart (hard cap)
 MAX_SERIES_POINTS = int(os.environ.get("BH_MAX_SERIES_POINTS", "240"))
 
-# Switch log
-SWITCH_LOG = os.environ.get("BH_SWITCH_LOG", "/var/log/backhaul-failover-switch.log")
-
-# -----------------------------
-# Flask app
-# -----------------------------
 app = Flask(__name__)
 
-def run(cmd: List[str], timeout: int = 25) -> subprocess.CompletedProcess:
+def run(cmd: List[str], timeout: int = 20) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout)
 
 def is_active(unit: str) -> bool:
@@ -54,32 +43,38 @@ def guard():
         return require_auth()
 
 # -----------------------------
-# Tunnels parsing
+# Robust primary detection (FIX)
 # -----------------------------
 def get_current_primary() -> Tuple[str, str]:
+    """
+    Use --current-raw (tab separated) to avoid log pollution.
+    Expected: "backhaul-iran403.service\t403"
+    """
     try:
-        p = run([FAILOVER_BIN, "--current"], timeout=10)
+        p = run([FAILOVER_BIN, "--current-raw"], timeout=10)
         s = (p.stdout or "").strip()
+        if not s:
+            return "-", "-"
+        # Some environments may print extra lines; pick the last line that matches pattern
+        lines = [ln.strip() for ln in s.splitlines() if ln.strip()]
+        for ln in reversed(lines):
+            parts = ln.split("\t")
+            if len(parts) >= 2 and parts[0].endswith(".service") and parts[1].isdigit():
+                return parts[0], parts[1]
+            # fallback: whitespace
+            w = ln.split()
+            if len(w) >= 2 and w[0].endswith(".service") and w[1].isdigit():
+                return w[0], w[1]
+        return "-", "-"
     except Exception:
         return "-", "-"
-    if not s:
-        return "-", "-"
-    parts = s.split()
-    if len(parts) >= 2:
-        return parts[0], parts[1]
-    return parts[0], "-"
 
+# -----------------------------
+# Tunnels parsing
+# -----------------------------
 def get_tunnels() -> List[Dict[str, str]]:
-    """
-    Parses output of --list-raw (tab separated, no header)
-    service \t active \t port \t toml
-    """
-    try:
-        p = run([FAILOVER_BIN, "--list-raw"], timeout=20)
-        raw = p.stdout or ""
-    except Exception:
-        raw = ""
-
+    p = run([FAILOVER_BIN, "--list-raw"], timeout=15)
+    raw = p.stdout or ""
     rows: List[Dict[str, str]] = []
     for line in raw.splitlines():
         line = line.strip()
@@ -96,11 +91,16 @@ def get_tunnels() -> List[Dict[str, str]]:
     return rows
 
 # -----------------------------
-# Traffic: read /run/backhaul-traffic/port-<PORT>.log
-# Format: "unix_ts bytes_sum"
+# Traffic logs
 # -----------------------------
 def traffic_log_path(port: str) -> str:
     return os.path.join(TRAFFIC_DIR, f"port-{port}.log")
+
+def ensure_traffic_dir():
+    try:
+        os.makedirs(TRAFFIC_DIR, exist_ok=True)
+    except Exception:
+        pass
 
 def read_last_lines(path: str, max_lines: int) -> List[str]:
     if not os.path.exists(path):
@@ -127,8 +127,6 @@ def parse_points(lines: List[str]) -> List[Tuple[int, int]]:
             pts.append((ts, b))
         except Exception:
             continue
-    # ensure sorted + unique-ish
-    pts.sort(key=lambda x: x[0])
     return pts
 
 def points_to_bps(points: List[Tuple[int, int]]) -> List[Tuple[int, float]]:
@@ -139,8 +137,13 @@ def points_to_bps(points: List[Tuple[int, int]]) -> List[Tuple[int, float]]:
     for ts, b in points[1:]:
         dt = ts - prev_ts
         db = b - prev_b
+        # move baseline early (important for resets)
         prev_ts, prev_b = ts, b
-        if dt <= 0 or db < 0:
+
+        if dt <= 0:
+            continue
+        if db < 0:
+            # counter reset / conn rotation; just skip this step
             continue
         out.append((ts, db / dt))
     return out
@@ -162,6 +165,46 @@ def avg(values: List[float]) -> float:
         return 0.0
     return sum(values) / len(values)
 
+# ---- Python sampler (FIX: keep chart alive) ----
+def get_port_bytes_sum_now(port: str) -> int:
+    """
+    Sum bytes_received + bytes_acked for TCP sessions on sport=:port.
+    """
+    try:
+        p = run(["ss", "-tinH", f"( sport = :{port} )"], timeout=3)
+        out = p.stdout or ""
+        rx = 0
+        tx = 0
+        for tok in out.replace("\n", " ").split():
+            if tok.startswith("bytes_received:"):
+                v = tok.split(":", 1)[1]
+                if v.isdigit():
+                    rx += int(v)
+            elif tok.startswith("bytes_acked:"):
+                v = tok.split(":", 1)[1]
+                if v.isdigit():
+                    tx += int(v)
+        return rx + tx
+    except Exception:
+        return 0
+
+def traffic_record_sample_py(port: str) -> None:
+    if not port or port == "-":
+        return
+    ensure_traffic_dir()
+    ts = int(time.time())
+    b = get_port_bytes_sum_now(port)
+    path = traffic_log_path(port)
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"{ts} {b}\n")
+        # trim
+        lines = read_last_lines(path, max_lines=400)
+        with open(path, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+    except Exception:
+        pass
+
 # -----------------------------
 # Logs: Tail + Live (SSE)
 # -----------------------------
@@ -173,7 +216,7 @@ def api_logs_tail():
     unit = request.args.get("unit", SERVICE_FAILOVER)
     lines = int(request.args.get("lines", "250"))
     try:
-        txt = run(["journalctl", "-u", unit, "-n", str(lines), "--no-pager", "-o", "cat"], timeout=15).stdout or ""
+        txt = run(["journalctl", "-u", unit, "-n", str(lines), "--no-pager", "-o", "cat"], timeout=12).stdout or ""
         return jsonify({"ok": True, "text": txt})
     except Exception as e:
         return jsonify({"ok": False, "text": f"[tail error] {e}"}), 500
@@ -185,7 +228,7 @@ def api_logs_live():
 
     def stream():
         try:
-            tail = run(["journalctl", "-u", unit, "-n", str(initial_lines), "--no-pager", "-o", "cat"], timeout=12).stdout or ""
+            tail = run(["journalctl", "-u", unit, "-n", str(initial_lines), "--no-pager", "-o", "cat"], timeout=10).stdout or ""
             for ln in tail.splitlines():
                 yield sse(ln)
         except Exception as e:
@@ -210,63 +253,15 @@ def api_logs_live():
     return Response(stream(), mimetype="text/event-stream")
 
 # -----------------------------
-# Switch log: Tail + Live (SSE)
-# -----------------------------
-def read_switch_tail(lines: int = 200) -> str:
-    if not os.path.exists(SWITCH_LOG):
-        return ""
-    try:
-        with open(SWITCH_LOG, "r", encoding="utf-8", errors="ignore") as f:
-            data = f.readlines()[-lines:]
-        return "".join(data)
-    except Exception:
-        return ""
-
-@app.get("/api/switch/tail")
-def api_switch_tail():
-    lines = int(request.args.get("lines", "200"))
-    return jsonify({"ok": True, "text": read_switch_tail(lines)})
-
-@app.get("/api/switch/live")
-def api_switch_live():
-    initial_lines = int(request.args.get("lines", "50"))
-
-    def stream():
-        txt = read_switch_tail(initial_lines)
-        for ln in (txt or "").splitlines():
-            yield sse(ln)
-
-        last_size = 0
-        while True:
-            try:
-                if not os.path.exists(SWITCH_LOG):
-                    time.sleep(1.0)
-                    continue
-                size = os.path.getsize(SWITCH_LOG)
-                if size < last_size:
-                    last_size = 0  # rotated
-                if size > last_size:
-                    with open(SWITCH_LOG, "r", encoding="utf-8", errors="ignore") as f:
-                        f.seek(last_size)
-                        chunk = f.read()
-                    last_size = size
-                    for ln in chunk.splitlines():
-                        yield sse(ln)
-                time.sleep(1.0)
-            except GeneratorExit:
-                return
-            except Exception as e:
-                yield sse(f"[switch follow error] {e}")
-                time.sleep(2.0)
-
-    return Response(stream(), mimetype="text/event-stream")
-
-# -----------------------------
-# Metrics
+# Metrics (FIX)
 # -----------------------------
 @app.get("/api/metrics")
 def api_metrics():
     primary_svc, primary_port = get_current_primary()
+
+    # Always record a sample so chart works even if timer is slow / restarted
+    if primary_port not in ("", "-"):
+        traffic_record_sample_py(primary_port)
 
     series = []
     now_bps = 0.0
@@ -275,7 +270,7 @@ def api_metrics():
 
     if primary_port not in ("", "-"):
         path = traffic_log_path(primary_port)
-        lines = read_last_lines(path, max_lines=MAX_SERIES_POINTS + 20)
+        lines = read_last_lines(path, max_lines=MAX_SERIES_POINTS + 10)
         pts = parse_points(lines)
         bps_pts = points_to_bps(pts)
 
@@ -332,38 +327,38 @@ def api_action():
 
     try:
         if action == "run_once":
-            out = run(["systemctl", "start", SERVICE_FAILOVER], timeout=25).stdout or ""
+            out = run(["systemctl", "start", SERVICE_FAILOVER], timeout=20).stdout or ""
             return jsonify({"ok": True, "output": out or "Failover check executed."})
 
         if action == "timer_on":
-            out = run(["systemctl", "enable", "--now", TIMER_FAILOVER], timeout=25).stdout or ""
+            out = run(["systemctl", "enable", "--now", TIMER_FAILOVER], timeout=20).stdout or ""
             return jsonify({"ok": True, "output": out or "Timer enabled."})
 
         if action == "timer_off":
-            out = run(["systemctl", "disable", "--now", TIMER_FAILOVER], timeout=25).stdout or ""
+            out = run(["systemctl", "disable", "--now", TIMER_FAILOVER], timeout=20).stdout or ""
             return jsonify({"ok": True, "output": out or "Timer disabled."})
 
         if action == "web_restart":
-            out = run(["systemctl", "restart", SERVICE_WEB], timeout=25).stdout or ""
+            out = run(["systemctl", "restart", SERVICE_WEB], timeout=20).stdout or ""
             return jsonify({"ok": True, "output": out or "Web service restarted."})
 
         if action in {"switch", "tunnel_start", "tunnel_stop", "tunnel_restart"} and not svc:
             return jsonify({"ok": False, "error": "Missing service name"}), 400
 
         if action == "switch":
-            out = run([FAILOVER_BIN, "--switch", svc], timeout=90).stdout or ""
+            out = run([FAILOVER_BIN, "--switch", svc], timeout=70).stdout or ""
             return jsonify({"ok": True, "output": out[-8000:] if out else "Switch command completed."})
 
         if action == "tunnel_start":
-            out = run([FAILOVER_BIN, "--start", svc], timeout=30).stdout or ""
+            out = run([FAILOVER_BIN, "--start", svc], timeout=25).stdout or ""
             return jsonify({"ok": True, "output": out[-4000:] if out else f"Started {svc}"})
 
         if action == "tunnel_stop":
-            out = run([FAILOVER_BIN, "--stop", svc], timeout=30).stdout or ""
+            out = run([FAILOVER_BIN, "--stop", svc], timeout=25).stdout or ""
             return jsonify({"ok": True, "output": out[-4000:] if out else f"Stopped {svc}"})
 
         if action == "tunnel_restart":
-            out = run([FAILOVER_BIN, "--restart", svc], timeout=45).stdout or ""
+            out = run([FAILOVER_BIN, "--restart", svc], timeout=35).stdout or ""
             return jsonify({"ok": True, "output": out[-6000:] if out else f"Restarted {svc}"})
 
         return jsonify({"ok": False, "error": "Unhandled action"}), 500
@@ -374,10 +369,9 @@ def api_action():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 # -----------------------------
-# UI (English, dark, responsive)
+# UI
 # -----------------------------
-HTML = r"""
-<!doctype html>
+HTML = r"""<!doctype html>
 <html lang="en" dir="ltr">
 <head>
   <meta charset="utf-8">
@@ -405,7 +399,6 @@ HTML = r"""
       --shadow: 0 14px 40px rgba(0,0,0,.35);
       --r:18px;
     }
-
     body{
       background:
         radial-gradient(900px 600px at 15% 10%, rgba(124,58,237,.22), transparent 60%),
@@ -414,139 +407,34 @@ HTML = r"""
       color: var(--text);
       min-height:100vh;
     }
-
-    .topbar{
-      position: sticky; top: 0; z-index: 50;
-      backdrop-filter: blur(10px);
-      background: rgba(6,8,18,.55);
-      border-bottom: 1px solid var(--line);
-    }
-
+    .topbar{ position: sticky; top: 0; z-index: 50; backdrop-filter: blur(10px); background: rgba(6,8,18,.55); border-bottom: 1px solid var(--line); }
     .brand{ font-weight: 900; letter-spacing: .3px; font-size: 1.05rem; }
     .subbrand{ color: var(--muted); font-size: .85rem; }
-
-    .chip{
-      border: 1px solid var(--line);
-      background: rgba(15,26,51,.55);
-      border-radius: 999px;
-      padding: .35rem .7rem;
-      display: inline-flex;
-      align-items: center;
-      gap: .45rem;
-      font-size: .85rem;
-      color: var(--muted);
-    }
+    .chip{ border: 1px solid var(--line); background: rgba(15,26,51,.55); border-radius: 999px; padding: .35rem .7rem; display: inline-flex; align-items: center; gap: .45rem; font-size: .85rem; color: var(--muted); }
     .dot{ width:10px; height:10px; border-radius:50%; display:inline-block; }
     .dot.good{ background: var(--good); box-shadow: 0 0 0 4px rgba(34,197,94,.12); }
     .dot.bad{  background: var(--bad);  box-shadow: 0 0 0 4px rgba(239,68,68,.12); }
-
-    .panel{
-      background: linear-gradient(180deg, rgba(15,26,51,.92), rgba(11,22,45,.92));
-      border: 1px solid var(--line);
-      border-radius: var(--r);
-      box-shadow: var(--shadow);
-      overflow: hidden;
-    }
-    .panel-h{
-      padding: 14px 16px;
-      border-bottom: 1px solid var(--line);
-      display:flex; justify-content:space-between; align-items:center; gap:10px;
-    }
+    .panel{ background: linear-gradient(180deg, rgba(15,26,51,.92), rgba(11,22,45,.92)); border: 1px solid var(--line); border-radius: var(--r); box-shadow: var(--shadow); overflow: hidden; }
+    .panel-h{ padding: 14px 16px; border-bottom: 1px solid var(--line); display:flex; justify-content:space-between; align-items:center; gap:10px; }
     .panel-b{ padding: 14px 16px; }
-
-    .btn-soft{
-      border-radius: 14px;
-      border: 1px solid var(--line);
-      background: rgba(15,26,51,.45);
-      color: var(--text);
-    }
+    .btn-soft{ border-radius: 14px; border: 1px solid var(--line); background: rgba(15,26,51,.45); color: var(--text); }
     .btn-soft:hover{ border-color: rgba(124,58,237,.85); }
-    .btn-accent{
-      border-radius: 14px;
-      border: 1px solid rgba(124,58,237,.75);
-      background: rgba(124,58,237,.18);
-      color: var(--text);
-    }
-    .btn-danger-soft{
-      border-radius: 14px;
-      border: 1px solid rgba(239,68,68,.55);
-      background: rgba(239,68,68,.12);
-      color: var(--text);
-    }
-
-    .kpi{
-      border: 1px solid var(--line);
-      background: rgba(8,12,24,.35);
-      border-radius: 16px;
-      padding: 12px;
-    }
+    .btn-accent{ border-radius: 14px; border: 1px solid rgba(124,58,237,.75); background: rgba(124,58,237,.18); color: var(--text); }
+    .btn-danger-soft{ border-radius: 14px; border: 1px solid rgba(239,68,68,.55); background: rgba(239,68,68,.12); color: var(--text); }
+    .kpi{ border: 1px solid var(--line); background: rgba(8,12,24,.35); border-radius: 16px; padding: 12px; }
     .kpi .label{ color: var(--muted); font-size: .85rem; }
     .kpi .value{ font-size: 1.2rem; font-weight: 900; letter-spacing:.2px; }
     .kpi .sub{ color: var(--muted); font-size: .8rem; }
-
-    .logbox{
-      height: 360px;
-      overflow: auto;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-      font-size: 12.5px;
-      line-height: 1.45;
-      background: rgba(6,8,18,.6);
-      border: 1px solid var(--line);
-      border-radius: 16px;
-      padding: 12px;
-      white-space: pre-wrap;
-    }
-
-    .table-dark{
-      --bs-table-bg: transparent;
-      --bs-table-color: var(--text);
-      --bs-table-border-color: var(--line);
-    }
-    .table thead th{
-      color: var(--muted);
-      font-weight: 800;
-      border-bottom: 1px solid var(--line) !important;
-    }
-    .table tbody td{
-      border-top: 1px solid rgba(90,120,200,.18) !important;
-      vertical-align: middle;
-    }
-
-    .chartWrap{
-      position: relative;
-      width: 100%;
-      height: 320px;
-      overflow: hidden;
-      border-radius: 16px;
-      border: 1px solid var(--line);
-      background: rgba(6,8,18,.35);
-    }
-    @media (max-width: 576px){
-      .chartWrap{ height: 240px; }
-      .logbox{ height: 300px; }
-      .kpi .value{ font-size: 1.05rem; }
-    }
-
+    .logbox{ height: 360px; overflow: auto; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 12.5px; line-height: 1.45; background: rgba(6,8,18,.6); border: 1px solid var(--line); border-radius: 16px; padding: 12px; white-space: pre-wrap; }
+    .table-dark{ --bs-table-bg: transparent; --bs-table-color: var(--text); --bs-table-border-color: var(--line); }
+    .table thead th{ color: var(--muted); font-weight: 800; border-bottom: 1px solid var(--line) !important; }
+    .table tbody td{ border-top: 1px solid rgba(90,120,200,.18) !important; vertical-align: middle; }
+    .chartWrap{ position: relative; width: 100%; height: 320px; overflow: hidden; border-radius: 16px; border: 1px solid var(--line); background: rgba(6,8,18,.35); }
+    @media (max-width: 576px){ .chartWrap{ height: 240px; } .logbox{ height: 300px; } .kpi .value{ font-size: 1.05rem; } }
     .toast-container{ z-index: 9999; }
-    .toast{
-      background: rgba(15,26,51,.96);
-      border: 1px solid var(--line);
-      color: var(--text);
-      border-radius: 16px;
-      box-shadow: var(--shadow);
-    }
-
-    .nav-pills .nav-link{
-      color: var(--muted);
-      border-radius: 14px;
-      border: 1px solid rgba(90,120,200,.18);
-      background: rgba(15,26,51,.35);
-    }
-    .nav-pills .nav-link.active{
-      color: var(--text);
-      border-color: rgba(124,58,237,.9);
-      background: rgba(124,58,237,.2);
-    }
+    .toast{ background: rgba(15,26,51,.96); border: 1px solid var(--line); color: var(--text); border-radius: 16px; box-shadow: var(--shadow); }
+    .nav-pills .nav-link{ color: var(--muted); border-radius: 14px; border: 1px solid rgba(90,120,200,.18); background: rgba(15,26,51,.35); }
+    .nav-pills .nav-link.active{ color: var(--text); border-color: rgba(124,58,237,.9); background: rgba(124,58,237,.2); }
     .tiny{ color: var(--muted); font-size: .85rem; }
   </style>
 </head>
@@ -586,7 +474,6 @@ HTML = r"""
     </div>
 
     <div class="tab-content">
-      <!-- Dashboard -->
       <div class="tab-pane fade show active" id="tab-dashboard">
         <div class="row g-3">
           <div class="col-12 col-lg-5">
@@ -625,8 +512,8 @@ HTML = r"""
 
                 <div class="mt-3 d-flex flex-wrap gap-2">
                   <button class="btn btn-accent btn-sm" onclick="refreshAll(true)"><i class="bi bi-arrow-clockwise"></i> Refresh</button>
-                  <button class="btn btn-soft btn-sm" onclick="loadTunnels(true)"><i class="bi bi-diagram-3-fill"></i> Reload tunnels</button>
-                  <button class="btn btn-soft btn-sm" onclick="loadTail(true)"><i class="bi bi-journal-text"></i> Refresh logs</button>
+                  <button class="btn btn-soft btn-sm" onclick="loadTunnels()"><i class="bi bi-diagram-3-fill"></i> Reload tunnels</button>
+                  <button class="btn btn-soft btn-sm" onclick="loadTail()"><i class="bi bi-journal-text"></i> Refresh logs</button>
                 </div>
               </div>
             </div>
@@ -669,7 +556,6 @@ HTML = r"""
         </div>
       </div>
 
-      <!-- Tunnels -->
       <div class="tab-pane fade" id="tab-tunnels">
         <div class="panel">
           <div class="panel-h">
@@ -677,7 +563,7 @@ HTML = r"""
               <i class="bi bi-diagram-3-fill" style="color:rgba(6,182,212,.95)"></i>
               <div class="fw-bold">Tunnel Manager</div>
             </div>
-            <button class="btn btn-soft btn-sm" onclick="loadTunnels(true)"><i class="bi bi-arrow-clockwise"></i> Reload</button>
+            <button class="btn btn-soft btn-sm" onclick="loadTunnels()"><i class="bi bi-arrow-clockwise"></i> Reload</button>
           </div>
           <div class="panel-b">
             <div class="table-responsive">
@@ -701,7 +587,6 @@ HTML = r"""
         </div>
       </div>
 
-      <!-- Logs -->
       <div class="tab-pane fade" id="tab-logs">
         <div class="row g-3">
           <div class="col-12 col-lg-6">
@@ -711,7 +596,7 @@ HTML = r"""
                   <i class="bi bi-journal-text" style="color:rgba(245,158,11,.95)"></i>
                   <div class="fw-bold">Logs (Tail)</div>
                 </div>
-                <button class="btn btn-soft btn-sm" onclick="loadTail(true)"><i class="bi bi-arrow-clockwise"></i> Refresh</button>
+                <button class="btn btn-soft btn-sm" onclick="loadTail()"><i class="bi bi-arrow-clockwise"></i> Refresh</button>
               </div>
               <div class="panel-b">
                 <div class="logbox" id="tailbox">Loading…</div>
@@ -736,33 +621,12 @@ HTML = r"""
               </div>
             </div>
           </div>
-
-          <div class="col-12">
-            <div class="panel">
-              <div class="panel-h">
-                <div class="d-flex align-items-center gap-2">
-                  <i class="bi bi-arrow-left-right" style="color:rgba(6,182,212,.95)"></i>
-                  <div class="fw-bold">Switch Log</div>
-                </div>
-                <div class="d-flex gap-2">
-                  <button class="btn btn-soft btn-sm" onclick="loadSwitchTail(true)"><i class="bi bi-arrow-clockwise"></i> Tail</button>
-                  <button class="btn btn-accent btn-sm" onclick="startSwitchLive()"><i class="bi bi-play-fill"></i> Live</button>
-                  <button class="btn btn-soft btn-sm" onclick="stopSwitchLive()"><i class="bi bi-stop-fill"></i> Stop</button>
-                </div>
-              </div>
-              <div class="panel-b">
-                <div class="logbox" id="switchbox">No switch events yet.</div>
-              </div>
-            </div>
-          </div>
-
         </div>
       </div>
 
     </div>
   </div>
 
-  <!-- Toast -->
   <div class="toast-container position-fixed bottom-0 start-0 p-3">
     <div id="toast" class="toast" role="alert" aria-live="assertive" aria-atomic="true">
       <div class="toast-body" id="toastBody">…</div>
@@ -773,19 +637,16 @@ HTML = r"""
 
   <script>
     const MAX_POINTS = 180;
-    const POLL_MS = 2500;
-
+    const POLL_MS = 2000;
     let lastChartKey = "";
-    let lastPrimaryPort = "";
     let chart;
+    let liveSource = null;
 
-    let refreshing = false;
-    let tunnelsLoading = false;
-    let tailLoading = false;
+    let refreshBusy = false;
 
     function toast(msg){
       document.getElementById("toastBody").textContent = msg;
-      const t = new bootstrap.Toast(document.getElementById("toast"), {delay: 1600});
+      const t = new bootstrap.Toast(document.getElementById("toast"), {delay: 2000});
       t.show();
     }
 
@@ -825,9 +686,7 @@ HTML = r"""
           normalized: true,
           plugins: {
             legend: { labels: { color: "#9fb0d8" } },
-            tooltip: {
-              callbacks: { label: (ctx) => " " + humanBps(ctx.raw || 0) }
-            }
+            tooltip: { callbacks: { label: (ctx) => " " + humanBps(ctx.raw || 0) } }
           },
           scales: {
             x: { ticks: { color: "#9fb0d8", maxTicksLimit: 8 }, grid: { color: "rgba(90,120,200,.15)" } },
@@ -844,34 +703,16 @@ HTML = r"""
       out.textContent = (block + out.textContent).slice(0, 14000);
     }
 
-    // fetch with timeout + credentials
-    async function fetchJson(url, opts={}){
-      const controller = new AbortController();
-      const t = setTimeout(() => controller.abort(), opts.timeoutMs || 9000);
-      try{
-        const res = await fetch(url, {
-          ...opts,
-          signal: controller.signal,
-          credentials: "same-origin"
-        });
-        clearTimeout(t);
-        const j = await res.json();
-        return j;
-      }catch(e){
-        clearTimeout(t);
-        throw e;
-      }
-    }
-
     async function action(actionName, service=null){
       try{
         toast("Executing…");
-        const j = await fetchJson("/api/action", {
+        const res = await fetch("/api/action", {
           method: "POST",
           headers: {"Content-Type":"application/json"},
-          body: JSON.stringify({action: actionName, service}),
-          timeoutMs: 20000
+          credentials: "same-origin",
+          body: JSON.stringify({action: actionName, service})
         });
+        const j = await res.json();
         if(!j.ok){
           toast("Error");
           pushOutput("ERROR: " + (j.error || "unknown"));
@@ -880,31 +721,25 @@ HTML = r"""
         toast("Done");
         pushOutput(j.output || "OK");
         await refreshAll(true);
-        await loadTunnels(true);
-        await loadSwitchTail(false);
+        await loadTunnels();
       }catch(e){
         toast("Network error");
-        pushOutput("EXCEPTION: " + String(e));
+        pushOutput("EXCEPTION: " + e);
       }
     }
 
-    async function loadTunnels(manual=false){
-      if(tunnelsLoading) return;
-      tunnelsLoading = true;
-
+    async function loadTunnels(){
       const body = document.getElementById("tunnelsBody");
       body.innerHTML = `<tr><td colspan="5" class="tiny">Loading…</td></tr>`;
-
       try{
-        const j = await fetchJson("/api/tunnels", {timeoutMs: 12000});
+        const res = await fetch("/api/tunnels", { credentials: "same-origin" });
+        const j = await res.json();
         if(!j.ok || !j.rows){
           body.innerHTML = `<tr><td colspan="5" class="tiny">Failed to load tunnels.</td></tr>`;
-          tunnelsLoading = false;
           return;
         }
         if(j.rows.length === 0){
           body.innerHTML = `<tr><td colspan="5" class="tiny">No tunnels found.</td></tr>`;
-          tunnelsLoading = false;
           return;
         }
         body.innerHTML = "";
@@ -933,10 +768,7 @@ HTML = r"""
           `);
         }
       }catch(e){
-        body.innerHTML = `<tr><td colspan="5" class="tiny">Network error loading tunnels.</td></tr>`;
-        if(manual) pushOutput("tunnels error: " + String(e));
-      }finally{
-        tunnelsLoading = false;
+        body.innerHTML = `<tr><td colspan="5" class="tiny">Error: ${escapeHtml(String(e))}</td></tr>`;
       }
     }
 
@@ -947,26 +779,19 @@ HTML = r"""
       return (s||"").replaceAll("'","\\'");
     }
 
-    async function loadTail(manual=false){
-      if(tailLoading) return;
-      tailLoading = true;
-
+    async function loadTail(){
       const box = document.getElementById("tailbox");
       box.textContent = "Loading…";
       try{
-        const j = await fetchJson("/api/logs/tail?lines=300", {timeoutMs: 14000});
+        const res = await fetch("/api/logs/tail?lines=300", { credentials: "same-origin" });
+        const j = await res.json();
         box.textContent = j.text || "";
         box.scrollTop = box.scrollHeight;
       }catch(e){
-        box.textContent = "Network error.";
-        if(manual) pushOutput("tail error: " + String(e));
-      }finally{
-        tailLoading = false;
+        box.textContent = "Error: " + e;
       }
     }
 
-    // Live logs
-    let liveSource = null;
     function startLive(){
       stopLive();
       const box = document.getElementById("livebox");
@@ -992,54 +817,12 @@ HTML = r"""
       }
     }
 
-    // Switch logs
-    let switchSource = null;
-
-    async function loadSwitchTail(manual=false){
-      const box = document.getElementById("switchbox");
-      box.textContent = "Loading…";
-      try{
-        const j = await fetchJson("/api/switch/tail?lines=250", {timeoutMs: 8000});
-        box.textContent = j.text || "No switch events yet.";
-        box.scrollTop = box.scrollHeight;
-      }catch(e){
-        box.textContent = "Network error.";
-        if(manual) pushOutput("switch tail error: " + String(e));
-      }
-    }
-
-    function startSwitchLive(){
-      stopSwitchLive();
-      const box = document.getElementById("switchbox");
-      box.textContent = "";
-      switchSource = new EventSource("/api/switch/live?lines=80");
-      switchSource.onmessage = (ev) => {
-        box.textContent += ev.data.replaceAll("\\n","\n") + "\n";
-        if(box.textContent.length > 24000){
-          box.textContent = box.textContent.slice(-20000);
-        }
-        box.scrollTop = box.scrollHeight;
-      };
-      switchSource.onerror = () => {
-        box.textContent += "\n[switch stream disconnected]\n";
-      };
-      toast("Switch live started");
-    }
-
-    function stopSwitchLive(){
-      if(switchSource){
-        switchSource.close();
-        switchSource = null;
-        toast("Switch live stopped");
-      }
-    }
-
     async function refreshAll(manual=false){
-      if(refreshing) return;
-      refreshing = true;
-
+      if(refreshBusy && !manual) return;
+      refreshBusy = true;
       try{
-        const m = await fetchJson("/api/metrics", {timeoutMs: 9000});
+        const res = await fetch("/api/metrics", { credentials: "same-origin" });
+        const m = await res.json();
 
         document.getElementById("primary-svc").textContent = m.primary.service || "-";
         document.getElementById("primary-port").textContent = m.primary.port || "-";
@@ -1052,16 +835,6 @@ HTML = r"""
         document.getElementById("kpi-1m").textContent = m.traffic.avg1m.human;
         document.getElementById("kpi-5m").textContent = m.traffic.avg5m.human;
 
-        // If primary port changed => reset chart key
-        const pport = String(m.primary.port || "");
-        if(pport !== lastPrimaryPort){
-          lastPrimaryPort = pport;
-          lastChartKey = "";
-          chart.data.labels = [];
-          chart.data.datasets[0].data = [];
-          chart.update("none");
-        }
-
         const series = (m.traffic.series || []).slice(-MAX_POINTS);
         const labels = series.map(x => {
           const d = new Date(x.t * 1000);
@@ -1069,7 +842,7 @@ HTML = r"""
         });
         const data = series.map(x => Number(x.bps)).map(v => (Number.isFinite(v) ? v : 0));
 
-        const key = String(labels.length) + ":" + (labels[labels.length-1] || "") + ":" + lastPrimaryPort;
+        const key = String(labels.length) + ":" + (labels[labels.length-1] || "");
         if(key !== lastChartKey){
           lastChartKey = key;
           chart.data.labels = labels;
@@ -1078,20 +851,16 @@ HTML = r"""
         }
 
       }catch(e){
-        if(manual){
-          pushOutput("metrics error: " + String(e));
-        }
+        pushOutput("metrics error: " + e);
       }finally{
-        refreshing = false;
+        refreshBusy = false;
       }
     }
 
-    // boot
     makeChart();
-    loadTunnels(false);
-    loadTail(false);
-    loadSwitchTail(false);
-    refreshAll(false);
+    loadTunnels();
+    loadTail();
+    refreshAll(true);
     setInterval(() => refreshAll(false), POLL_MS);
   </script>
 </body>
